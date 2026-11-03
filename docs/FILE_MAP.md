@@ -172,7 +172,7 @@ mpv2-claw's `cap_display` on a small ST7789 + `esp_lvgl_port` service.
 
 | File | What it does |
 |---|---|
-| [wasm_host_functions.{h,cc}](../main/sdk/wasm_host_functions.cc) | The `env` module a skill imports: `MPX_ABI_VERSION`, the `robot_*` / `mpx_*` native symbols and their implementations, plus the `control_owner` query used by `main.cc`. ABI v7 adds the microphone (`mpx_mic_start` / `mpx_mic_read` / `mpx_mic_stop`), which a skill can open because the run holds voice back. |
+| [wasm_host_functions.{h,cc}](../main/sdk/wasm_host_functions.cc) | The `env` module a skill imports: `MPX_ABI_VERSION`, the `robot_*` / `mpx_*` native symbols and their implementations, plus the `control_owner` query used by `main.cc`. ABI v7 adds the microphone (`mpx_mic_start` / `mpx_mic_read` / `mpx_mic_stop`), which a skill can open because the run holds voice back. ABI v8 adds speaker playback from local WAV files (`mpx_audio_play_file`) and HTTP(S) streams (`mpx_audio_stream_url`). ABI v9 adds blocking HTTP(S) API requests (`mpx_http_get` / `mpx_http_post`) with responses copied into skill memory. |
 
 ### main/skills/ — the agent's skills
 

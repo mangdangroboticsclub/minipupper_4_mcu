@@ -44,6 +44,8 @@ DECLARE_EMBED(eye_open_svg_gz);
 DECLARE_EMBED(eye_close_svg);
 DECLARE_EMBED(eye_close_svg_gz);
 DECLARE_EMBED(m_pupper3d_js_gz);       // three.js viewer chunk, gz only
+DECLARE_EMBED(m_preview3d_js_gz);      // skill-preview viewer chunk, gz only
+DECLARE_EMBED(m_three_module_js_gz);   // shared three.js chunk, gz only
 DECLARE_EMBED(pupper_model_json_gz);   // gz only, see main/CMakeLists.txt
 
 /* ── File descriptor table ──────────────────────────────────── */
@@ -78,6 +80,8 @@ static const AssetFile ASSETS[] = {
     ASSET_ENTRY("/eye-close.svg",    eye_close_svg),
     ASSET_ENTRY("/eye-close.svg.gz", eye_close_svg_gz),
     ASSET_ENTRY("/m-pupper3d.js.gz",     m_pupper3d_js_gz),
+    ASSET_ENTRY("/m-preview3d.js.gz",    m_preview3d_js_gz),
+    ASSET_ENTRY("/m-three.module.js.gz", m_three_module_js_gz),
     ASSET_ENTRY("/pupper_model.json.gz", pupper_model_json_gz),
 };
 

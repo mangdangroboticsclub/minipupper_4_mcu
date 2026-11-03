@@ -13,6 +13,10 @@ import { playbackStride } from "./previewTrace.js";
 
 const UP = new Vector3(0, 1, 0);
 const DEFAULT_HERO = [0.42, 0.34, 0.22];
+const EASE_S = 0.12;
+const SNAP_M = 0.6;
+const SNAP_RAD = Math.PI / 3;
+const wrapAngle = (angle) => Math.atan2(Math.sin(angle), Math.cos(angle));
 
 /** [forward, left, up] in robot-heading coordinates -> three world space. */
 function cameraOffset(offset, yaw) {
@@ -31,6 +35,26 @@ function disposeMaterial(material, textures) {
   material.dispose();
 }
 
+function disposeObject(root) {
+  const textures = new Set();
+  const geometries = new Set();
+  const materials = new Set();
+  root.traverse((node) => {
+    if (node.geometry && !geometries.has(node.geometry)) {
+      geometries.add(node.geometry);
+      node.geometry.dispose();
+    }
+    if (node.material) {
+      for (const material of Array.isArray(node.material) ? node.material : [node.material]) {
+        if (!materials.has(material)) {
+          materials.add(material);
+          disposeMaterial(material, textures);
+        }
+      }
+    }
+  });
+}
+
 /**
  * @param {HTMLElement} container
  * @param {{glbArrayBuffer:ArrayBuffer, trace:object, manifest:object,
@@ -39,24 +63,31 @@ function disposeMaterial(material, textures) {
 export async function init(container, { glbArrayBuffer, trace, manifest, onTime, onEnd }) {
   const canvas = document.createElement("canvas");
   canvas.style.cssText = "display:block;width:100%;height:100%;touch-action:none";
-  canvas.setAttribute("aria-label", "Orbitable 3D skill preview");
+  canvas.setAttribute("aria-label", "Orbitable 3D skill preview; Space plays, arrows step frames");
+  canvas.tabIndex = 0;
   container.appendChild(canvas);
 
-  const renderer = new WebGLRenderer({ canvas, antialias: true, alpha: false });
-  renderer.setClearColor(0xf5f3ee);
+  let renderer;
+  try {
+    renderer = new WebGLRenderer({ canvas, antialias: true, alpha: false });
+  } catch (error) {
+    canvas.remove();
+    throw error;
+  }
+  renderer.setClearColor(0x191a17);
   renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
   renderer.outputEncoding = 1501; // THREE.sRGBEncoding (three 0.149)
 
   const scene = new Scene();
   const camera = new PerspectiveCamera(40, 1, 0.01, 14);
   camera.up.copy(UP);
-  scene.add(new HemisphereLight(0xffffff, 0x827b70, 1.0));
+  scene.add(new HemisphereLight(0xffffff, 0x24251f, 1.0));
   const key = new DirectionalLight(0xffffff, 0.85);
   key.position.set(0.5, 1.2, 0.7);
   scene.add(key);
 
   const groundGeometry = new CircleGeometry(1.4, 64);
-  const groundMaterial = new MeshStandardMaterial({ color: 0xe9e5dc, roughness: 1 });
+  const groundMaterial = new MeshStandardMaterial({ color: 0x24251f, roughness: 1 });
   const ground = new Mesh(groundGeometry, groundMaterial);
   ground.rotation.x = -Math.PI / 2;
   ground.position.y = -0.001;
@@ -78,7 +109,14 @@ export async function init(container, { glbArrayBuffer, trace, manifest, onTime,
   }
 
   const base = model.getObjectByName(manifest.rig?.base_node || "base");
-  if (!base) throw new Error(`Preview rig has no ${manifest.rig?.base_node || "base"} node`);
+  if (!base) {
+    disposeObject(model);
+    groundGeometry.dispose();
+    groundMaterial.dispose();
+    renderer.dispose();
+    canvas.remove();
+    throw new Error(`Preview rig has no ${manifest.rig?.base_node || "base"} node`);
+  }
 
   const joints = [];
   model.traverse((node) => {
@@ -113,7 +151,10 @@ export async function init(container, { glbArrayBuffer, trace, manifest, onTime,
   const jointRotation = new Quaternion();
   const baseWorld = new Vector3();
   const followedBase = new Vector3();
-  let hasFollowedBase = false;
+  let followedYaw = 0;
+  let baseYaw = 0;
+  let follow = true;
+  let heading = true;
   let tSkill = 0;
   let rate = speed;
   let stride = playbackStride(rate, speed, fps);
@@ -141,31 +182,44 @@ export async function init(container, { glbArrayBuffer, trace, manifest, onTime,
     }
     model.updateMatrixWorld(true);
     base.getWorldPosition(baseWorld);
-
-    // Follow translation so a walking robot stays framed; leave the customer's
-    // orbit angle alone. Presets explicitly re-apply heading when requested.
-    if (hasFollowedBase) {
-      const dx = baseWorld.x - followedBase.x;
-      const dy = baseWorld.y - followedBase.y;
-      const dz = baseWorld.z - followedBase.z;
-      camera.position.x += dx; camera.position.y += dy; camera.position.z += dz;
-      controls.target.x += dx; controls.target.y += dy; controls.target.z += dz;
-    } else {
-      hasFollowedBase = true;
-    }
-    followedBase.copy(baseWorld);
+    // Swing-twist heading: pitch, roll and backflips must not swing the camera
+    // 180 degrees. The orbit catches up in updateCamera, once per render.
+    baseYaw = 2 * Math.atan2(f[o + 6], f[o + 3]);
+    if (!Number.isFinite(baseYaw)) baseYaw = 0;
   }
 
   function setPreset(name) {
     const presets = manifest.camera_presets || {};
     const presetName = presets[name] ? name : "hero";
     const offset = presets[presetName]?.offset_m || DEFAULT_HERO;
-    const o = frameIndex() * trace.width;
-    const yaw = 2 * Math.atan2(trace.frames[o + 6], trace.frames[o + 3]);
     controls.target.copy(baseWorld);
-    camera.position.copy(baseWorld).add(cameraOffset(offset, yaw));
+    camera.position.copy(baseWorld).add(cameraOffset(offset, baseYaw));
     followedBase.copy(baseWorld);
+    followedYaw = baseYaw;
     controls.update();
+  }
+
+  function updateCamera(dt) {
+    if (!follow) return;
+    const distance = followedBase.distanceTo(baseWorld);
+    const turn = wrapAngle(baseYaw - followedYaw);
+    const k = distance > SNAP_M || Math.abs(turn) > SNAP_RAD
+      ? 1
+      : 1 - Math.exp(-dt / EASE_S);
+    const move = baseWorld.clone().sub(followedBase).multiplyScalar(k);
+    followedBase.add(move);
+    controls.target.add(move);
+    camera.position.add(move);
+    if (heading) {
+      const dYaw = turn * k;
+      followedYaw = wrapAngle(followedYaw + dYaw);
+      if (dYaw) {
+        const arm = camera.position.clone().sub(controls.target).applyAxisAngle(UP, dYaw);
+        camera.position.copy(controls.target).add(arm);
+      }
+    } else {
+      followedYaw = baseYaw;
+    }
   }
 
   function reportTime(force = false) {
@@ -209,6 +263,7 @@ export async function init(container, { glbArrayBuffer, trace, manifest, onTime,
         onEnd?.();
       }
     }
+    updateCamera(dt);
     controls.update();
     renderer.render(scene, camera);
   };
@@ -236,7 +291,18 @@ export async function init(container, { glbArrayBuffer, trace, manifest, onTime,
       applyFrame();
       reportTime(true);
     },
+    step(direction) {
+      pause();
+      const next = Math.max(0, Math.min(trace.count - 1, frameIndex() + Math.sign(direction || 1) * stride));
+      tSkill = next * 1000 * speed / fps;
+      applyFrame();
+      reportTime(true);
+    },
     setPreset,
+    setFollow(nextFollow, nextHeading = heading) {
+      follow = Boolean(nextFollow);
+      heading = Boolean(nextHeading);
+    },
     dispose() {
       if (dead) return;
       dead = true;
@@ -244,23 +310,7 @@ export async function init(container, { glbArrayBuffer, trace, manifest, onTime,
       cancelAnimationFrame(raf);
       ro.disconnect();
       controls.dispose();
-      const textures = new Set();
-      const geometries = new Set();
-      const materials = new Set();
-      model.traverse((node) => {
-        if (node.geometry && !geometries.has(node.geometry)) {
-          geometries.add(node.geometry);
-          node.geometry.dispose();
-        }
-        if (node.material) {
-          for (const material of Array.isArray(node.material) ? node.material : [node.material]) {
-            if (!materials.has(material)) {
-              materials.add(material);
-              disposeMaterial(material, textures);
-            }
-          }
-        }
-      });
+      disposeObject(model);
       groundGeometry.dispose();
       groundMaterial.dispose();
       renderer.renderLists.dispose();

@@ -83,6 +83,31 @@ export function playbackStride(rate, speed, traceFps) {
   return { stride, effectiveFps: traceFps / stride };
 }
 
+/**
+ * Resolve a cloud-relative preview base ("/v1/preview/...") to an absolute
+ * URL on the gateway itself, so the browser fetches previews directly instead
+ * of streaming them through the ESP32. Returns "" when the gateway config is
+ * unavailable (AP-only mode) — callers then fall back to the on-device relay.
+ */
+let gatewayOriginPromise = null;
+export function cloudPreviewBase(base) {
+  if (!base || !base.startsWith("/")) return Promise.resolve(base || "");
+  gatewayOriginPromise ||= (async () => {
+    try {
+      const res = await fetch("/v1/gateway/config");
+      if (!res.ok) return "";
+      const cfg = await res.json();
+      if (!cfg.host || !cfg.port) return "";
+      // The gateway is plain HTTP on the mesh/LAN; the PWA itself is served
+      // over HTTP from the robot, so there is no mixed-content upgrade.
+      return `http://${cfg.host}:${cfg.port}`;
+    } catch {
+      return "";
+    }
+  })();
+  return gatewayOriginPromise.then((origin) => (origin ? origin + base : ""));
+}
+
 /** Root URL for one skill version's preview files. */
 export function previewBaseUrl(skillId, version, base) {
   return (base || `/api/preview/${encodeURIComponent(skillId)}/${encodeURIComponent(version)}`).replace(/\/+$/, "");
@@ -92,45 +117,74 @@ export function previewFileUrl(skillId, version, file, base) {
   return `${previewBaseUrl(skillId, version, base)}/${file}`;
 }
 
-async function fetchBytes(url) {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Preview file failed: ${url} → ${res.status}`);
-  return res.arrayBuffer();
+async function fetchWithRetry(url, read, { signal, allowNotFound = false } = {}) {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    let retryAfter = 350;
+    try {
+      const timeout = AbortSignal.timeout(30000);
+      const res = await fetch(url, { signal: signal ? AbortSignal.any([signal, timeout]) : timeout });
+      if (allowNotFound && res.status === 404) return res;
+      if (!res.ok) {
+        const error = new Error(`Preview file failed: ${url} → ${res.status}`);
+        error.retryable = [408, 429, 500, 502, 503, 504].includes(res.status);
+        const advertised = Number(res.headers.get("Retry-After"));
+        if (Number.isFinite(advertised) && advertised > 0) retryAfter = advertised * 1000;
+        throw error;
+      }
+      return await read(res);
+    } catch (error) {
+      const retryable = error.retryable || error instanceof TypeError || error.name === "TimeoutError";
+      if (signal?.aborted || !retryable || attempt === 2) throw error;
+      await new Promise((resolve) => setTimeout(resolve, retryAfter));
+    }
+  }
+  throw new Error(`Preview file failed: ${url}`);
+}
+
+function fetchBytes(url, signal) {
+  return fetchWithRetry(url, (res) => res.arrayBuffer(), { signal });
 }
 
 /** Fetch only the manifest; a 404 is the normal "no preview" result. */
-export async function fetchPreviewManifest(skillId, version, { base } = {}) {
-  const res = await fetch(previewFileUrl(skillId, version, "manifest.json", base));
+export async function fetchPreviewManifest(skillId, version, { base, signal } = {}) {
+  const url = previewFileUrl(skillId, version, "manifest.json", base);
+  const res = await fetchWithRetry(url, async (response) => response, { signal, allowNotFound: true });
   if (res.status === 404) return null;
-  if (!res.ok) throw new Error(`Preview manifest failed: ${res.status}`);
   const manifest = await res.json();
   if (manifest.preview_format !== 2) throw new Error(`Unsupported preview format: ${manifest.preview_format}`);
   return manifest;
 }
 
 /**
- * Fetch geometry and motion for the lazy viewer. `base` is supplied by cloud
- * detail as detail.preview.base; on-device it defaults to /api/preview/....
+ * Fetch geometry and motion for the lazy viewer. Direct gateway failures fall
+ * back to the robot relay, which may already have a warm artifact cache.
  */
-export async function fetchPreview(skillId, version, { base, manifest } = {}) {
-  manifest ||= await fetchPreviewManifest(skillId, version, { base });
-  if (!manifest) return null;
+export async function fetchPreview(skillId, version, { base, manifest, signal } = {}) {
+  const load = async (requestBase) => {
+    const currentManifest = manifest || await fetchPreviewManifest(skillId, version, { base: requestBase, signal });
+    if (!currentManifest) return null;
+    const glb = currentManifest.files?.find((f) => f.mime === "model/gltf-binary")?.name || `${currentManifest.sku}.glb`;
+    const traceFile = currentManifest.trace?.file || "trace.bin.gz";
+    // The relay has one uncached-download slot. Serial requests avoid a cold
+    // cache 429; the retry helper honors Retry-After for external contention.
+    const storedTrace = await fetchBytes(previewFileUrl(skillId, version, traceFile, requestBase), signal);
+    const glbArrayBuffer = await fetchBytes(previewFileUrl(skillId, version, glb, requestBase), signal);
 
-  const glb = manifest.files?.find((f) => f.mime === "model/gltf-binary")?.name || `${manifest.sku}.glb`;
-  const traceFile = manifest.trace?.file || "trace.bin.gz";
-  const [glbArrayBuffer, storedTrace] = await Promise.all([
-    fetchBytes(previewFileUrl(skillId, version, glb, base)),
-    fetchBytes(previewFileUrl(skillId, version, traceFile, base)),
-  ]);
+    // fetch() may already have inflated Content-Encoding:gzip.
+    const magic = new DataView(storedTrace).getUint32(0, true);
+    const traceBuffer = magic === PREVIEW_TRACE_MAGIC
+      ? storedTrace
+      : await new Response(
+          new Blob([storedTrace]).stream().pipeThrough(new DecompressionStream("gzip")),
+        ).arrayBuffer();
+    return { manifest: currentManifest, glbArrayBuffer, trace: decodePreviewTrace(traceBuffer) };
+  };
 
-  // fetch() transparently inflates Content-Encoding:gzip responses. Relays or
-  // test servers may instead return the stored gzip bytes, so inflate only when
-  // the MPXT magic is not already present.
-  const magic = new DataView(storedTrace).getUint32(0, true);
-  const traceBuffer = magic === PREVIEW_TRACE_MAGIC
-    ? storedTrace
-    : await new Response(
-        new Blob([storedTrace]).stream().pipeThrough(new DecompressionStream("gzip")),
-      ).arrayBuffer();
-  return { manifest, glbArrayBuffer, trace: decodePreviewTrace(traceBuffer) };
+  try {
+    const result = await load(base || "");
+    if (result || !base) return result;
+  } catch (error) {
+    if (!base || signal?.aborted) throw error;
+  }
+  return load("");
 }

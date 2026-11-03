@@ -1,8 +1,20 @@
 import { defineConfig } from "vite";
 import { svelte } from "@sveltejs/vite-plugin-svelte";
 
+// Build identity, logged by src/main.js. Asset names are stable across builds
+// (the firmware embeds a fixed file list), so without a stamp there is no way
+// to tell "this browser is running an old cached m.js" from "the new bundle is
+// broken" — a distinction that cost a full debugging cycle. Override with
+// MPX_BUILD=<label> npm run build.
+const buildId =
+  process.env.MPX_BUILD || new Date().toISOString().replace(/[-:TZ.]/g, "").slice(0, 12);
+
 export default defineConfig({
   plugins: [svelte()],
+
+  define: {
+    __MPX_BUILD__: JSON.stringify(buildId),
+  },
 
   root: "src",
   publicDir: "../public",
@@ -45,6 +57,10 @@ export default defineConfig({
         target: `http://${process.env.ROBOT_HOST || "192.168.1.107"}`,
         changeOrigin: true,
         ws: true,
+      },
+      "/api": {
+        target: `http://${process.env.ROBOT_HOST || "192.168.1.107"}`,
+        changeOrigin: true,
       },
     },
   },
