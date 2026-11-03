@@ -9,8 +9,11 @@
 #include <vector>
 
 #include <dirent.h>
+#include <strings.h>
 
+#include "esp_crt_bundle.h"
 #include "esp_err.h"
+#include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -1726,6 +1729,131 @@ int32_t host_music_stop(wasm_exec_env_t exec_env)
 #else
 	return MPX_ERR_STATE;
 #endif
+}
+
+// ── speaker audio (ABI v8) ───────────────────────────────────
+
+int32_t host_mpx_audio_play_file(wasm_exec_env_t exec_env, int32_t path_ptr)
+{
+	(void)exec_env;
+	if (wasm::was_cancelled()) return MPX_ERR_CANCELLED;
+
+	const char *path = guest_str(path_ptr);
+	if (!path || !*path) return MPX_ERR_ARG;
+
+	return from_esp_err(mpx_audio_play_wav(path));
+}
+
+int32_t host_mpx_audio_stream_url(wasm_exec_env_t exec_env, int32_t url_ptr)
+{
+	if (wasm::was_cancelled()) return MPX_ERR_CANCELLED;
+
+	const char *url = guest_str(url_ptr);
+	if (!url || (strncasecmp(url, "http://", 7) != 0 &&
+				 strncasecmp(url, "https://", 8) != 0)) {
+		return MPX_ERR_ARG;
+	}
+
+#if CONFIG_APP_VOICE_ENABLE
+	(void)exec_env;
+	return from_esp_err(cap_music_play(url, nullptr, 0));
+#else
+	(void)exec_env; (void)url;
+	return MPX_ERR_STATE;
+#endif
+}
+
+// ── internet APIs (ABI v9) ───────────────────────────────────
+
+namespace {
+
+struct HttpResponseBuffer {
+	char *data;
+	std::size_t cap;  /* response bytes, excluding the terminating NUL */
+	std::size_t len;
+};
+
+esp_err_t http_response_event(esp_http_client_event_t *event)
+{
+	if (event->event_id != HTTP_EVENT_ON_DATA || !event->user_data ||
+			event->data_len <= 0) {
+		return ESP_OK;
+	}
+
+	auto *out = static_cast<HttpResponseBuffer *>(event->user_data);
+	const std::size_t available = out->len < out->cap ? out->cap - out->len : 0;
+	const std::size_t incoming = static_cast<std::size_t>(event->data_len);
+	const std::size_t copy = incoming < available ? incoming : available;
+	if (copy > 0) {
+		std::memcpy(out->data + out->len, event->data, copy);
+		out->len += copy;
+	}
+	return ESP_OK;
+}
+
+int32_t http_request(wasm_exec_env_t exec_env, esp_http_client_method_t method,
+					 int32_t url_ptr, int32_t body_ptr,
+					 int32_t response_ptr, int32_t cap)
+{
+	if (wasm::was_cancelled()) return MPX_ERR_CANCELLED;
+
+	const char *url = guest_str(url_ptr);
+	if (!url || (strncasecmp(url, "http://", 7) != 0 &&
+				 strncasecmp(url, "https://", 8) != 0)) {
+		return MPX_ERR_ARG;
+	}
+	if (response_ptr == 0 || cap <= 0) return MPX_ERR_ARG;
+
+	char *response = static_cast<char *>(
+		wasm_ptr(exec_env, response_ptr, static_cast<uint32_t>(cap)));
+	if (!response) return MPX_ERR_ARG;
+	response[0] = '\0';
+
+	HttpResponseBuffer out = {
+		response, static_cast<std::size_t>(cap - 1), 0
+	};
+	esp_http_client_config_t config = {};
+	config.url = url;
+	config.method = method;
+	config.event_handler = http_response_event;
+	config.user_data = &out;
+	config.timeout_ms = 15000;
+	config.buffer_size = 2048;
+	config.crt_bundle_attach = esp_crt_bundle_attach;
+
+	esp_http_client_handle_t client = esp_http_client_init(&config);
+	if (!client) return MPX_ERR_STATE;
+
+	const char *body = guest_str(body_ptr);
+	if (method == HTTP_METHOD_POST) {
+		esp_http_client_set_header(client, "Content-Type", "application/json");
+		if (body) esp_http_client_set_post_field(client, body, std::strlen(body));
+	}
+
+	const esp_err_t err = esp_http_client_perform(client);
+	const int status = esp_http_client_get_status_code(client);
+	esp_http_client_cleanup(client);
+	response[out.len] = '\0';
+
+	if (err != ESP_OK) return from_esp_err(err);
+	if (wasm::was_cancelled()) return MPX_ERR_CANCELLED;
+	return status;
+}
+
+}  // namespace
+
+int32_t host_mpx_http_get(wasm_exec_env_t exec_env, int32_t url_ptr,
+						  int32_t response_ptr, int32_t cap)
+{
+	return http_request(exec_env, HTTP_METHOD_GET, url_ptr, 0,
+						response_ptr, cap);
+}
+
+int32_t host_mpx_http_post(wasm_exec_env_t exec_env, int32_t url_ptr,
+						   int32_t body_ptr, int32_t response_ptr, int32_t cap)
+{
+	return http_request(exec_env, HTTP_METHOD_POST, url_ptr, body_ptr,
+						response_ptr, cap);
 }
 
 // ── robot state ──────────────────────────────────────────────

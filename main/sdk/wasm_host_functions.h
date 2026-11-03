@@ -94,7 +94,12 @@ namespace sdk {
  *
  * Additive like v6: every v6 symbol is unchanged, so a v6 module still runs.
  * A v7 module will NOT run on v6 firmware (missing imports), hence the bump. */
-constexpr int32_t MPX_ABI_VERSION = 7;
+/* v8 adds speaker playback from a skill: mpx_audio_play_file plays a local
+ * 16-bit PCM WAV synchronously; mpx_audio_stream_url starts asynchronous
+ * HTTP(S) playback through the music player. Existing imports are unchanged. */
+/* v9 adds mpx_http_get / mpx_http_post for HTTP(S) API requests. Both return
+ * the HTTP status and copy the response into caller-owned WASM memory. */
+constexpr int32_t MPX_ABI_VERSION = 9;
 
 /* Every host function returns one of these, or a value >= 0 where it is
  * documented to return data. Before v2 there were four incompatible
@@ -779,6 +784,47 @@ int32_t host_music_play(wasm_exec_env_t exec_env, int32_t what_ptr,
 /** extern int music_stop(void); "()i". Stops the speaker. */
 int32_t host_music_stop(wasm_exec_env_t exec_env);
 
+// ── speaker audio (ABI v8) ───────────────────────────────────
+
+/** extern int mpx_audio_play_file(const char *path); "($)i".
+ *
+ *  Plays a 16-bit PCM mono or stereo WAV from LittleFS through the speaker.
+ *  The path is absolute inside LittleFS (for example "/alert.wav"), as for
+ *  fs_read. This call blocks until playback finishes. Returns MPX_OK,
+ *  MPX_ERR_ARG for an invalid path/file/format, MPX_ERR_STATE when no speaker
+ *  is available, or MPX_ERR_CANCELLED if the run was cancelled before starting. */
+int32_t host_mpx_audio_play_file(wasm_exec_env_t exec_env, int32_t path_ptr);
+
+/** extern int mpx_audio_stream_url(const char *url); "($)i".
+ *
+ *  Starts asynchronous audio streaming from an http:// or https:// URL.
+ *  Returns after queueing the request, not when the stream ends. Use
+ *  music_stop() to stop playback. Formats are those supported by the music
+ *  player (MP3, AAC, M4A, FLAC and WAV). Returns MPX_ERR_ARG for an invalid
+ *  URL and MPX_ERR_STATE when streaming is unavailable. */
+int32_t host_mpx_audio_stream_url(wasm_exec_env_t exec_env, int32_t url_ptr);
+
+// ── internet APIs (ABI v9) ───────────────────────────────────
+
+/** extern int mpx_http_get(const char *url, void *response, int cap);
+ *  "($ii)i".
+ *
+ *  Performs a blocking HTTP(S) GET with a 15-second timeout. Writes up to
+ *  cap-1 response bytes and a terminating NUL; larger responses truncate.
+ *  Returns the HTTP status (including 4xx/5xx), or a negative MPX_ERR_* for
+ *  invalid arguments, cancellation, or a transport/TLS failure. */
+int32_t host_mpx_http_get(wasm_exec_env_t exec_env, int32_t url_ptr,
+						  int32_t response_ptr, int32_t cap);
+
+/** extern int mpx_http_post(const char *url, const char *body,
+ *                          void *response, int cap); "($$ii)i".
+ *
+ *  Performs a blocking HTTP(S) POST, sending body as application/json (a null
+ *  body sends an empty request). Response handling, status and errors are the
+ *  same as mpx_http_get. */
+int32_t host_mpx_http_post(wasm_exec_env_t exec_env, int32_t url_ptr,
+						   int32_t body_ptr, int32_t response_ptr, int32_t cap);
+
 // ── robot state: the composite getters ───────────────────────
 
 /** extern int robot_get_config(int *out); "(i)i". Writes six ints — period,
@@ -972,6 +1018,16 @@ static NativeSymbol NATIVE_SYMBOLS[] = {
 	{ "mpx_mic_start",        (void *)host_mpx_mic_start,        "(i)i",    nullptr },
 	{ "mpx_mic_read",         (void *)host_mpx_mic_read,         "(ii)i",   nullptr },
 	{ "mpx_mic_stop",         (void *)host_mpx_mic_stop,         "()i",     nullptr },
+
+	// ── ABI v8 ──────────────────────────────────────────────────────────────
+	// Speaker audio: local files and network streams
+	{ "mpx_audio_play_file",  (void *)host_mpx_audio_play_file,  "($)i",    nullptr },
+	{ "mpx_audio_stream_url", (void *)host_mpx_audio_stream_url, "($)i",    nullptr },
+
+	// ── ABI v9 ──────────────────────────────────────────────────────────────
+	// Internet APIs: GET and JSON POST with the response in guest memory
+	{ "mpx_http_get",         (void *)host_mpx_http_get,         "($ii)i",  nullptr },
+	{ "mpx_http_post",        (void *)host_mpx_http_post,        "($$ii)i", nullptr },
 };
 
 static constexpr uint32_t NUM_NATIVE_SYMBOLS =
