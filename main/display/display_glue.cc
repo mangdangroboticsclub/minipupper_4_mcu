@@ -31,6 +31,7 @@
 #include "network/wifi_sta.h"
 #include "pi/pi_link.h"
 #include "robot/mpx_robot.h"
+#include "robot/driver_board.h"
 
 static const char *TAG = "display_glue";
 
@@ -146,6 +147,37 @@ void display_glue::start_face()
     pi_link::set_ip_observer(on_pi_ip);
     pi_link::set_video_sink(cap_display_show_jpeg);   /* the Pi's camera picture */
 #endif
+}
+
+void display_glue::show_boot_check()
+{
+    const db_boot_check_t *c = driver_board_boot_check_result();
+    if (!c || !c->ran || c->count == 0 || !cap_display_available()) {
+        return;
+    }
+    const int W = cap_display_draw_width(), H = cap_display_draw_height();
+    if (W <= 0 || H <= 0) {
+        return;
+    }
+    const uint32_t RED = 0xFF5050, AMBER = 0xFFB020, WHITE = 0xF0F0F0, GREY = 0x9AA0A8;
+    cap_display_draw_fill(0x000000);
+    cap_display_draw_rect(0, 0, W, 38, c->worst >= 2 ? 0x5A0000 : 0x4A3000, 0, 0);
+    cap_display_draw_text(10, 4, c->worst >= 2 ? "SERVO PROBLEM" : "SERVO WARNING", WHITE, 28, -1, W - 20);
+    int y = 46;
+    for (int i = 0; i < c->count && y < H - 30; i++) {
+        /* the 14 px font fits ~42 characters in 300 px; a line wraps to as many rows as it needs */
+        const int rows = 1 + (int)std::strlen(c->line[i]) / 40;
+        cap_display_draw_rect(10, y + 5, 6, 6, c->sev[i] >= 2 ? RED : AMBER, -1, 0);
+        cap_display_draw_text(22, y, c->line[i], c->sev[i] >= 2 ? WHITE : 0xFFE0A0, 14, -1, W - 30);
+        y += rows * 17 + 6;
+    }
+    char foot[48];
+    std::snprintf(foot, sizeof foot, c->more ? "+%d more - see the serial log" : "%d/4 servo boards answer",
+                  c->more ? c->more : c->boards);
+    cap_display_draw_text(10, H - 20, foot, GREY, 14, -1, W - 20);
+    if (cap_display_draw_show(30000) != ESP_OK) {
+        ESP_LOGW(TAG, "boot check not shown");
+    }
 }
 
 void display_glue::start_animations()

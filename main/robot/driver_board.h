@@ -368,6 +368,29 @@ bool driver_board_raw_feedback(int servo, uint16_t *pos_dd, int16_t *cur_mA,
  * an earlier session is reported as current. */
 void driver_board_raw_invalidate(void);
 
+/* ---- boot check ---------------------------------------------------------
+ * Run once at boot, after driver_board_init() and before the gait task (it
+ * needs the bus to itself; it sends all-IDLE frames only, so nothing moves;
+ * ~60 ms on a healthy robot). Finds a driver board that garbles the OTHER
+ * boards' replies on the shared SPI MISO line (holds it all the time, or lets
+ * go of it late), boards whose own replies are damaged (and whether a slower
+ * clock fixes it = cable), missing boards, and servo temperature sensors that
+ * are open, shorted, too hot at power-on or far off the others. Each problem
+ * is one short sentence naming the board / servo, logged and kept for the
+ * screen (display_glue::show_boot_check). Returns true when all is well. */
+#define DB_BOOT_MAX_LINES 8
+typedef struct {
+    bool    ran;
+    int     boards;                       /* boards that answered (0..4)          */
+    int     count;                        /* problems in line[]                   */
+    int     more;                         /* problems that did not fit            */
+    int     worst;                        /* 0 all well, 1 warning, 2 fault       */
+    uint8_t sev[DB_BOOT_MAX_LINES];       /* 1 warning, 2 fault                   */
+    char    line[DB_BOOT_MAX_LINES][112];
+} db_boot_check_t;
+bool driver_board_boot_check(void);
+const db_boot_check_t *driver_board_boot_check_result(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -24,6 +24,11 @@ void start_animations();
  *  badge. Call after Wi-Fi is up; registers the Pi link observers itself. */
 void start_events();
 
+/** If the boot check (driver_board_boot_check, run in robot::init) found a
+ *  problem: which board / servo, on the screen for 30 s, then the face comes
+ *  back. Nothing is shown when all is well. Call after start_face(). */
+void show_boot_check();
+
 /** From robot::set_master_observer -- runs on the Pi link task, so it only
  *  posts an event. */
 void on_master_changed(bool active);

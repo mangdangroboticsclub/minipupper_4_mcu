@@ -12,6 +12,10 @@
  */
 #include "driver_board.h"
 
+#include <math.h>      /* fabsf - boot check */
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>    /* qsort - boot check */
 #include <string.h>
 #include "driver/spi_master.h"
 #include "driver/gpio.h"
@@ -943,4 +947,324 @@ float driver_board_present_temperature(int ch)
     int16_t dc = fb_temp_dc[db_phys(ch) - 1];
     if (dc == FB_TEMP_NONE) return DB_TEMP_INVALID;
     return (float)dc * 0.1f;
+}
+
+/* ============================================================================
+ * BOOT CHECK  -  driver_board_boot_check()
+ *
+ * All four boards share ONE MISO wire back to the ESP32. A board that keeps
+ * driving it when it is not its turn (or lets go of it late) garbles the
+ * OTHER boards' replies - one bad board makes every other leg read nonsense
+ * temperatures and positions. This finds which board it is, once, at boot,
+ * before the gait task exists (it needs the bus to itself), and also checks
+ * each servo's temperature sensor. Every frame it sends is an all-IDLE frame,
+ * so nothing moves. About 60 ms on a healthy robot.
+ *
+ * How a reply is judged: the AT32 (at32f413_spi_protocol.c) always fills 12
+ * bytes of a servo reply with fixed values - start 0xFEED, status 0x0003, the
+ * three reserved2 fields 0 and check_sum 0xDEAD. A reply is good only when all
+ * 12 are right.
+ *
+ * The tests (the factory test's SPI check, shortened for boot):
+ *   1. which connectors answer at all
+ *   2. MISO with NO board selected, read once pulled down and once pulled up:
+ *      it should follow both. If it does not, some board drives it all the
+ *      time - and the board whose own replies are still clean is that board.
+ *   3. MISO right after each board's turn: not free = that board lets go late
+ *   4. each board's own replies (30)      5. if (3) found one: which boards it
+ *   garbles (board B read right after A)  6. if a board's replies are bad:
+ *   the same at 2 MHz - clean there = cable / connector, not the board
+ * ========================================================================== */
+#define BC_CHECK_WORD 0xDEAD
+#define BC_N          30
+#define BC_NP         12
+enum { BC_OK, BC_CFG, BC_EMPTY, BC_SHIFT, BC_BAD };
+enum { BC_FREE, BC_HIGH, BC_LOW, BC_NOISY };
+
+static db_boot_check_t s_boot;
+static spi_device_handle_t s_dev_none;      /* no chip select: nobody should answer */
+
+const db_boot_check_t *driver_board_boot_check_result(void) { return &s_boot; }
+
+static bool bc_all(const void *buf, uint8_t v)
+{
+    const uint8_t *p = (const uint8_t *)buf;
+    for (int i = 0; i < (int)sizeof(SMS_host_t); i++) if (p[i] != v) return false;
+    return true;
+}
+
+static int bc_classify(const SMS_host_t *r)
+{
+    if (bc_all(r, 0x00) || bc_all(r, 0xFF)) return BC_EMPTY;          /* nothing on this connector */
+    if (r->start == FB_START_FIELD && r->check_sum == BC_CHECK_WORD) {
+        if (r->status == START_CONFIG) return BC_CFG;
+        if (r->status == FB_STATUS_SERVO && !r->s1.res2 && !r->s2.res2 && !r->s3.res2) return BC_OK;
+    }
+    const uint8_t *p = (const uint8_t *)r;                             /* the whole reply 1 byte late/early */
+    if ((p[1] == 0xED && p[2] == 0xFE) || (p[0] == 0xFE && p[33] == 0xAD && p[34] == 0xDE)) return BC_SHIFT;
+    return BC_BAD;
+}
+static bool bc_damaged(int k) { return k == BC_SHIFT || k == BC_BAD || k == BC_EMPTY; }
+
+/* one all-IDLE frame to a PHYSICAL board; the reply kind (and the reply) */
+static int bc_probe(int board, SMS_host_t *keep)
+{
+    host_SMS_t f;
+    SMS_host_t rx;
+    memset(&f, 0, sizeof f);
+    f.start = START_FIELD;
+    f.mode  = MODE_FIELD;
+    servo_cmd_sub_t *sub[3] = { &f.s1, &f.s2, &f.s3 };
+    for (int j = 0; j < 3; j++) {
+        sub[j]->mode     = DB_MODE_IDLE;
+        sub[j]->position = sh_posdd[board * 3 + j];
+    }
+    if (spi_xfer((uint8_t)board, sizeof f, (uint8_t *)&f, (uint8_t *)&rx) != ESP_OK) return BC_BAD;
+    const int k = bc_classify(&rx);
+    if (k == BC_OK && keep) *keep = rx;
+    return k;
+}
+
+/* MISO with no board selected: free = follows the pull-down and the pull-up */
+static int bc_bus(void)
+{
+    uint8_t tx[36] __attribute__((aligned(4))) = { 0 };
+    uint8_t dn[36] __attribute__((aligned(4))), up[36] __attribute__((aligned(4)));
+    spi_transaction_t t;
+    if (!s_dev_none) return BC_FREE;
+    gpio_pullup_dis(SPI_MASTER_MISO); gpio_pulldown_en(SPI_MASTER_MISO); esp_rom_delay_us(20);
+    memset(&t, 0, sizeof t); t.length = 36 * 8; t.tx_buffer = tx; t.rx_buffer = dn;
+    const bool okd = spi_device_transmit(s_dev_none, &t) == ESP_OK;
+    gpio_pulldown_dis(SPI_MASTER_MISO); gpio_pullup_en(SPI_MASTER_MISO); esp_rom_delay_us(20);
+    memset(&t, 0, sizeof t); t.length = 36 * 8; t.tx_buffer = tx; t.rx_buffer = up;
+    const bool oku = spi_device_transmit(s_dev_none, &t) == ESP_OK;
+    if (!okd || !oku) return BC_NOISY;
+    bool d0 = true, dF = true, u0 = true, uF = true;
+    for (int i = 0; i < 36; i++) {
+        d0 &= dn[i] == 0x00; dF &= dn[i] == 0xFF; u0 &= up[i] == 0x00; uF &= up[i] == 0xFF;
+    }
+    if (d0 && uF) return BC_FREE;
+    if (dF && uF) return BC_HIGH;
+    if (d0 && u0) return BC_LOW;
+    return BC_NOISY;
+}
+
+/* the four board devices again, at another clock (same order as init) */
+static bool bc_reattach(int hz)
+{
+    spi_device_interface_config_t dev = { .mode = 0, .duty_cycle_pos = 128, .clock_speed_hz = hz, .queue_size = 2 };
+    struct { int cs; spi_device_handle_t *out; } devs[4] = {
+        { SPI_MASTER_CS0, &dev_left_front }, { SPI_MASTER_CS1, &dev_right_front },
+        { SPI_MASTER_CS2, &dev_left_rear  }, { SPI_MASTER_CS3, &dev_right_rear  },
+    };
+    bool ok = true;
+    for (int i = 0; i < 4; i++) {
+        spi_bus_remove_device(*devs[i].out);
+        dev.spics_io_num = devs[i].cs;
+        ok &= spi_bus_add_device(SPI_MASTER_ID, &dev, devs[i].out) == ESP_OK;
+    }
+    return ok;
+}
+
+/* connector of a PHYSICAL board, from its chip-select pin */
+static const char *bc_cn(int board)
+{
+    const int pin = board == 0 ? (int)SPI_MASTER_CS1 : board == 1 ? (int)SPI_MASTER_CS0
+                  : board == 2 ? (int)SPI_MASTER_CS3 : (int)SPI_MASTER_CS2;
+    switch (pin) {
+        case 15: return "CN3";
+        case 7:  return "CN4";
+        case 4:  return "CN5";
+        case 5:  return "CN6";
+        default: return "CN?";
+    }
+}
+
+static const char *const bc_leg_name[4]  = { "FR", "FL", "RR", "RL" };
+static const char *const bc_part_name[3] = { "hip", "thigh", "calf" };
+
+static void bc_add(db_boot_check_t *o, int sev, const char *fmt, ...)
+{
+    if (sev > o->worst) o->worst = sev;
+    if (o->count >= DB_BOOT_MAX_LINES) { o->more++; return; }
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(o->line[o->count], sizeof o->line[0], fmt, ap);
+    va_end(ap);
+    o->sev[o->count++] = (uint8_t)sev;
+}
+
+/* "FR board (servos 1-3, CN3)" */
+static const char *bc_leg(int L, const int bd[4])
+{
+    static char buf[4][48];
+    snprintf(buf[L], sizeof buf[L], "%s board (servos %d-%d, %s)", bc_leg_name[L], 3 * L + 1, 3 * L + 3, bc_cn(bd[L]));
+    return buf[L];
+}
+
+static int bc_cmp(const void *a, const void *b) { const float x = *(const float *)a, y = *(const float *)b; return (x > y) - (x < y); }
+
+bool driver_board_boot_check(void)
+{
+    db_boot_check_t *o = &s_boot;
+    int  bd[4], own[4] = { 0 }, slow[4] = { 0 }, pair[4][4] = { { 0 } };
+    bool present[4] = { false }, late[4] = { false }, long_late[4] = { false }, got[4] = { false };
+    SMS_host_t good[4];
+    int  np = 0, idle;
+
+    memset(o, 0, sizeof *o);
+    o->ran = true;
+    if (!s_lock) return false;
+
+    DB_LOCK();
+    {
+        spi_device_interface_config_t none = { .mode = 0, .duty_cycle_pos = 128,
+                                               .clock_speed_hz = 12 * 1000 * 1000, .queue_size = 1,
+                                               .spics_io_num = -1 };
+        if (spi_bus_add_device(SPI_MASTER_ID, &none, &s_dev_none) != ESP_OK) s_dev_none = NULL;
+    }
+    for (int L = 0; L < 4; L++) {                                   /* 1. who is there */
+        bd[L] = (db_phys(3 * L + 1) - 1) / 3;
+        for (int i = 0; i < 6 && !present[L]; i++) {
+            if (bc_probe(bd[L], NULL) != BC_EMPTY) present[L] = true;
+            esp_rom_delay_us(300);
+        }
+        np += present[L];
+    }
+    idle = bc_bus();                                                /* 2. nobody selected */
+    for (int L = 0; L < 4; L++) {                                   /* 3. right after its turn */
+        if (!present[L] || idle != BC_FREE) continue;
+        for (int i = 0; i < 3 && !late[L]; i++) {
+            bc_probe(bd[L], NULL);
+            if (bc_bus() != BC_FREE) late[L] = true;
+            esp_rom_delay_us(300);
+        }
+        if (late[L]) {
+            bc_probe(bd[L], NULL);
+            esp_rom_delay_us(1000);
+            long_late[L] = bc_bus() != BC_FREE;
+        }
+    }
+    for (int L = 0; L < 4; L++) {                                   /* 4. its own replies */
+        if (!present[L]) continue;
+        for (int i = 0; i < BC_N; i++) {
+            if (bc_damaged(bc_probe(bd[L], &good[L]))) own[L]++; else got[L] = true;
+            esp_rom_delay_us(300);
+        }
+    }
+    bool any_late = false;
+    for (int L = 0; L < 4; L++) any_late |= late[L];
+    if (any_late)                                                   /* 5. whom does it garble */
+        for (int x = 0; x < 4; x++)
+            for (int y = 0; y < 4; y++) {
+                if (x == y || !present[x] || !present[y] || !late[x]) continue;
+                for (int i = 0; i < BC_NP; i++) {
+                    bc_probe(bd[x], NULL);
+                    if (bc_damaged(bc_probe(bd[y], NULL))) pair[x][y]++;
+                    esp_rom_delay_us(1000);
+                }
+            }
+    bool slow_test = false;
+    for (int L = 0; L < 4; L++) slow_test |= present[L] && idle == BC_FREE && !late[L] && own[L] * 10 >= BC_N;
+    if (slow_test && bc_reattach(2 * 1000 * 1000)) {                /* 6. the same, slowly */
+        for (int L = 0; L < 4; L++) {
+            if (!present[L] || own[L] * 10 < BC_N) continue;
+            for (int i = 0; i < BC_N; i++) {
+                if (bc_damaged(bc_probe(bd[L], &good[L]))) slow[L]++; else got[L] = true;
+                esp_rom_delay_us(300);
+            }
+        }
+    }
+    if (slow_test) bc_reattach(12 * 1000 * 1000);
+    if (s_dev_none) { spi_bus_remove_device(s_dev_none); s_dev_none = NULL; }
+    gpio_pulldown_dis(SPI_MASTER_MISO);
+    gpio_pullup_en(SPI_MASTER_MISO);                                /* nobody talking = 0xFF, not noise */
+    DB_UNLOCK();
+
+    o->boards = np;
+    /* ---- the verdict, worst first ---- */
+    if (np == 0) {
+        bc_add(o, 2, "No servo board answers on CN3-CN6. Battery on? Cables in?");
+        if (idle != BC_FREE) bc_add(o, 2, "SPI line held with no board plugged in: the ESP32 board itself");
+    } else if (idle != BC_FREE) {
+        int clean = 0, clean_leg = -1, dirty = 0;
+        char list[64] = "";
+        for (int L = 0; L < 4; L++) {
+            if (!present[L]) continue;
+            if (own[L] * 10 < BC_N) { clean++; clean_leg = L; }
+            else if (own[L] * 10 >= BC_N * 3) {
+                dirty++;
+                snprintf(list + strlen(list), sizeof list - strlen(list), "%s%s", list[0] ? ", " : "", bc_leg_name[L]);
+            }
+        }
+        if (np == 1) {
+            int only = 0;
+            for (int L = 0; L < 4; L++) if (present[L]) only = L;
+            bc_add(o, 2, "%s never lets go of the SPI line - every other board will read garbage. Replace it.", bc_leg(only, bd));
+        }
+        else if (clean == 1 && dirty == np - 1)
+            bc_add(o, 2, "%s holds the SPI line and garbles %s. Unplug or replace it.", bc_leg(clean_leg, bd), list);
+        else if (clean == 0)
+            bc_add(o, 2, "2 or more boards hold the SPI line - every reply garbled. Plug in one board at a time (factory test SPI check).");
+        else
+            bc_add(o, 2, "SPI line held by a board - garbled: %s", list[0] ? list : "-");
+    } else {
+        for (int L = 0; L < 4; L++) {
+            if (!late[L]) continue;
+            char hurt[48] = "";
+            for (int y = 0; y < 4; y++)
+                if (pair[L][y] * 10 >= BC_NP * 3)
+                    snprintf(hurt + strlen(hurt), sizeof hurt - strlen(hurt), "%s%s", hurt[0] ? ", " : "", bc_leg_name[y]);
+            bc_add(o, 2, "%s lets go of the SPI line %s%s%s. Replace it.", bc_leg(L, bd),
+                   long_late[L] ? "very late" : "late", hurt[0] ? " and garbles " : "", hurt);
+        }
+        for (int L = 0; L < 4; L++) {
+            if (!present[L] || late[L] || own[L] * 10 < BC_N) continue;
+            if (slow[L] * 20 < BC_N)
+                bc_add(o, 1, "%s: SPI errors at full speed (%d%%), fine slower - cable or connector", bc_leg(L, bd), own[L] * 100 / BC_N);
+            else
+                bc_add(o, 2, "%s: its replies are garbled (%d%%) - board, cable or connector", bc_leg(L, bd), own[L] * 100 / BC_N);
+        }
+    }
+    if (np > 0 && np < 4)
+        for (int L = 0; L < 4; L++)
+            if (!present[L]) bc_add(o, 1, "%s: no answer - not plugged in?", bc_leg(L, bd));
+
+    /* ---- temperature sensors, from clean replies only ---- */
+    float t[12];
+    bool  tv[12] = { false };
+    for (int L = 0; L < 4; L++) {
+        if (!got[L]) continue;
+        const servo_fb_sub_t *s[3] = { &good[L].s1, &good[L].s2, &good[L].s3 };
+        if (!s[0]->res1 && !s[1]->res1 && !s[2]->res1) continue;    /* old AT32 firmware: no temperature */
+        for (int j = 0; j < 3; j++) {
+            /* the board's channel j is physical channel bd*3+j; which LOGICAL servo is that */
+            const int id = db_phys_inv(bd[L] * 3 + j + 1);
+            const int sl = (id - 1) % 3, sL = (id - 1) / 3;
+            const float c = (int16_t)s[j]->res1 / 10.0f;
+            if (c <= -30.0f)      bc_add(o, 2, "Servo %d (%s %s): temperature sensor open / unplugged", id, bc_leg_name[sL], bc_part_name[sl]);
+            else if (c >= 150.0f) bc_add(o, 2, "Servo %d (%s %s): temperature sensor shorted", id, bc_leg_name[sL], bc_part_name[sl]);
+            else if (c >= 60.0f)  bc_add(o, 2, "Servo %d (%s %s): %.0f C at power-on - too hot", id, bc_leg_name[sL], bc_part_name[sl], c);
+            else { t[id - 1] = c; tv[id - 1] = true; }
+        }
+    }
+    for (int id = 1; id <= 12; id++) {                               /* one sensor far off the others */
+        if (!tv[id - 1]) continue;
+        float other[12];
+        int n = 0;
+        for (int k = 0; k < 12; k++) if (k != id - 1 && tv[k]) other[n++] = t[k];
+        if (n < 3) continue;
+        qsort(other, n, sizeof other[0], bc_cmp);
+        const float med = n % 2 ? other[n / 2] : (other[n / 2 - 1] + other[n / 2]) / 2;
+        if (fabsf(t[id - 1] - med) > 10.0f)
+            bc_add(o, 1, "Servo %d (%s %s): temperature %.0f C, the others %.0f C - sensor?", id,
+                   bc_leg_name[(id - 1) / 3], bc_part_name[(id - 1) % 3], t[id - 1], med);
+    }
+
+    if (o->count == 0)
+        ESP_LOGI(TAG, "boot check: %d/4 boards, SPI line clean, temperature sensors OK", np);
+    for (int i = 0; i < o->count; i++)
+        ESP_LOGW(TAG, "boot check: %s", o->line[i]);
+    if (o->more) ESP_LOGW(TAG, "boot check: ... and %d more", o->more);
+    return o->count == 0;
 }

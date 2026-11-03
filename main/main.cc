@@ -138,6 +138,7 @@ extern "C" void app_main(void)
 
 	// ── Screen: the Display page's GIFs live on LittleFS ──────
 	display_glue::start_animations();
+	display_glue::show_boot_check();   /* a servo / SPI problem found at boot: on the screen for 30 s */
 
 	// ── Network: start Wi-Fi AP (Core 0, Priority 6) ──────────
 	if (!network::init_wifi_ap()) {

@@ -777,6 +777,15 @@ bool init()
             s_bt.boards_at = bt_now();
         }
 
+        // Boot check: is the shared SPI line healthy, and are the servo
+        // temperature sensors sane? Finds the board that garbles the OTHER
+        // boards' replies (holds MISO, or lets go of it late), damaged replies,
+        // missing boards and bad temperature sensors. All-IDLE frames only, so
+        // nothing moves; ~60 ms on a healthy robot. Problems are logged here
+        // and drawn on the screen once it is up (display_glue::show_boot_check).
+        // Before probe_scale and the gait task: it needs the bus to itself.
+        driver_board_boot_check();
+
         // Adopt the boards' own range_position_deg rather than assuming one.
         // A robot that was range-trimmed on the reference firmware keeps that
         // trim in the driver boards' flash, where an ESP reflash cannot reach
