@@ -19,6 +19,7 @@
 #include <string>
 
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -149,10 +150,13 @@ void display_glue::start_face()
 #endif
 }
 
-void display_glue::show_boot_check()
+/* A message screen: a coloured title bar, then one line per item (a red or
+ * amber dot in front, long lines wrap), a grey footer. The face comes back
+ * after hold_ms. */
+static void draw_message(const char *title, bool fault, const char *const *lines,
+                         const uint8_t *sev, int n, const char *foot, uint32_t hold_ms)
 {
-    const db_boot_check_t *c = driver_board_boot_check_result();
-    if (!c || !c->ran || c->count == 0 || !cap_display_available()) {
+    if (!cap_display_available()) {
         return;
     }
     const int W = cap_display_draw_width(), H = cap_display_draw_height();
@@ -161,22 +165,124 @@ void display_glue::show_boot_check()
     }
     const uint32_t RED = 0xFF5050, AMBER = 0xFFB020, WHITE = 0xF0F0F0, GREY = 0x9AA0A8;
     cap_display_draw_fill(0x000000);
-    cap_display_draw_rect(0, 0, W, 38, c->worst >= 2 ? 0x5A0000 : 0x4A3000, 0, 0);
-    cap_display_draw_text(10, 4, c->worst >= 2 ? "SERVO PROBLEM" : "SERVO WARNING", WHITE, 28, -1, W - 20);
+    cap_display_draw_rect(0, 0, W, 38, fault ? 0x5A0000 : 0x4A3000, 0, 0);
+    cap_display_draw_text(10, 4, title, WHITE, 28, -1, W - 20);
     int y = 46;
-    for (int i = 0; i < c->count && y < H - 30; i++) {
+    for (int i = 0; i < n && y < H - 30; i++) {
         /* the 14 px font fits ~42 characters in 300 px; a line wraps to as many rows as it needs */
-        const int rows = 1 + (int)std::strlen(c->line[i]) / 40;
-        cap_display_draw_rect(10, y + 5, 6, 6, c->sev[i] >= 2 ? RED : AMBER, -1, 0);
-        cap_display_draw_text(22, y, c->line[i], c->sev[i] >= 2 ? WHITE : 0xFFE0A0, 14, -1, W - 30);
+        const int rows = 1 + (int)std::strlen(lines[i]) / 40;
+        cap_display_draw_rect(10, y + 5, 6, 6, sev[i] >= 2 ? RED : AMBER, -1, 0);
+        cap_display_draw_text(22, y, lines[i], sev[i] >= 2 ? WHITE : 0xFFE0A0, 14, -1, W - 30);
         y += rows * 17 + 6;
+    }
+    if (foot && foot[0]) {
+        cap_display_draw_text(10, H - 20, foot, GREY, 14, -1, W - 20);
+    }
+    if (cap_display_draw_show(hold_ms) != ESP_OK) {
+        ESP_LOGW(TAG, "message not shown: %s", title);
+    }
+}
+
+void display_glue::show_boot_check()
+{
+    const db_boot_check_t *c = driver_board_boot_check_result();
+    if (!c || !c->ran || c->count == 0) {
+        return;
+    }
+    const char *lines[DB_BOOT_MAX_LINES];
+    for (int i = 0; i < c->count; i++) {
+        lines[i] = c->line[i];
     }
     char foot[48];
     std::snprintf(foot, sizeof foot, c->more ? "+%d more - see the serial log" : "%d/4 servo boards answer",
                   c->more ? c->more : c->boards);
-    cap_display_draw_text(10, H - 20, foot, GREY, 14, -1, W - 20);
-    if (cap_display_draw_show(30000) != ESP_OK) {
-        ESP_LOGW(TAG, "boot check not shown");
+    draw_message(c->worst >= 2 ? "SERVO PROBLEM" : "SERVO WARNING", c->worst >= 2,
+                 lines, c->sev, c->count, foot, 30000);
+}
+
+/* ── Temperature watch ─────────────────────────────────────────────────── */
+namespace {
+
+constexpr float    FIRST_MINUTE_C = 60.0f;   /* from cold: over this in the first minute = faulty */
+constexpr float    TOO_HOT_C      = 80.0f;   /* any time after that                              */
+constexpr float    TOO_HOT_CLEAR  = 75.0f;   /* below this the "too hot" warning is re-armed     */
+constexpr int64_t  FIRST_MINUTE_US = 60LL * 1000 * 1000;
+constexpr uint32_t REPEAT_MS      = 60000;   /* repeat "too hot" this often while it stays hot   */
+
+const char *const LEG[4]  = { "FR", "FL", "RR", "RL" };
+const char *const PART[3] = { "hip", "thigh", "calf" };
+
+void temp_watch_task(void *)
+{
+    const int64_t t0 = esp_timer_get_time();
+    uint8_t  over[13] = { 0 };          /* readings in a row over the limit                  */
+    bool     faulty[13] = { false };    /* first-minute warning already given                */
+    bool     hot[13] = { false };       /* "too hot" active (until it is below TOO_HOT_CLEAR) */
+    int64_t  hot_shown[13] = { 0 };
+    static char text[6][96];
+
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        driver_board_refresh_stale(1500);          /* only when nothing else is talking to the boards */
+        const int64_t now = esp_timer_get_time();
+        const bool first_minute = now - t0 < FIRST_MINUTE_US;
+        const char *lines[6];
+        uint8_t sev[6];
+        int n = 0;
+        bool new_fault = false, new_hot = false;
+
+        for (int id = 1; id <= 12; id++) {
+            float c;
+            uint32_t age;
+            if (!driver_board_checked_temperature(id, &c, &age) || age > 3000 || c <= -30.0f || c >= 150.0f) {
+                over[id] = 0;                       /* no fresh reading, or a broken sensor (the boot check says so) */
+                continue;
+            }
+            const char *leg = LEG[(id - 1) / 3], *part = PART[(id - 1) % 3];
+            if (first_minute) {
+                over[id] = c > FIRST_MINUTE_C ? over[id] + 1 : 0;
+                if (over[id] >= 2 && !faulty[id]) {
+                    faulty[id] = true;
+                    new_fault = true;
+                    ESP_LOGW(TAG, "servo %d (%s %s) %.0f C in the first minute after power-on - faulty", id, leg, part, c);
+                    if (n < 6) {
+                        std::snprintf(text[n], sizeof text[n], "Servo %d (%s %s): %.0f C in the first minute - faulty",
+                                      id, leg, part, c);
+                        sev[n] = 2; lines[n] = text[n]; n++;
+                    }
+                }
+                continue;
+            }
+            if (c < TOO_HOT_CLEAR) {
+                hot[id] = false;
+            }
+            over[id] = c > TOO_HOT_C ? over[id] + 1 : 0;
+            if (over[id] >= 2 && (!hot[id] || (now - hot_shown[id]) / 1000 >= REPEAT_MS)) {
+                hot[id] = true;
+                hot_shown[id] = now;
+                new_hot = true;
+                ESP_LOGW(TAG, "servo %d (%s %s) %.0f C - temperature too high", id, leg, part, c);
+                if (n < 6) {
+                    std::snprintf(text[n], sizeof text[n], "Servo %d (%s %s): %.0f C", id, leg, part, c);
+                    sev[n] = 2; lines[n] = text[n]; n++;
+                }
+            }
+        }
+        if (new_hot) {
+            draw_message("TEMPERATURE TOO HIGH", true, lines, sev, n, "let it cool down", 15000);
+        } else if (new_fault) {
+            draw_message("SERVO FAULTY", true, lines, sev, n, "over 60 C within a minute of power-on", 30000);
+        }
+    }
+}
+
+}  // namespace
+
+void display_glue::start_temp_watch()
+{
+    /* Internal-RAM stack: the SPI transfers it makes go through DMA. */
+    if (xTaskCreate(temp_watch_task, "temp_watch", 4096, nullptr, 2, nullptr) != pdPASS) {
+        ESP_LOGE(TAG, "temperature watch did not start");
     }
 }
 

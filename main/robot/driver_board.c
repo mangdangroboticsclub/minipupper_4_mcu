@@ -153,6 +153,14 @@ static inline bool fb_frame_valid(const SMS_host_t *rx)
  * caches. b = index of the board's first physical channel (0,3,6,9). */
 static bool fb_fresh[12];   /* set by fb_store; driver_board_sync_idle clears it first */
 
+/* The temperature again, but only from replies that pass the FULL check (all
+ * 12 fixed bytes: start 0xFEED, status 0x0003, the reserved2 fields 0,
+ * check_sum 0xDEAD - see the boot check below), with the time it came. The
+ * temperature watch (display_glue) reads these, so a reply garbled on the SPI
+ * line can never raise a false "too hot". fb_temp_dc above is unchanged. */
+static int16_t fb_temp_ok_dc[12];
+static int64_t fb_temp_ok_us[4];   /* per PHYSICAL board, 0 = never */
+
 static void fb_store(int b, const SMS_host_t *rx)
 {
     const servo_fb_sub_t *fb[3] = { &rx->s1, &rx->s2, &rx->s3 };
@@ -161,6 +169,11 @@ static void fb_store(int b, const SMS_host_t *rx)
         fb_position[b + j] = (uint16_t)((float)fb[j]->position * 1024.0f / db_scale_dd);
         fb_current[b + j]  = fb[j]->torque;          /* present motor current, mA */
         fb_temp_dc[b + j]  = (int16_t)fb[j]->res1;   /* NTC temperature, 0.1 degC */
+    }
+    if (rx->status == FB_STATUS_SERVO && rx->check_sum == 0xDEAD &&
+        !rx->s1.res2 && !rx->s2.res2 && !rx->s3.res2) {
+        for (int j = 0; j < 3; j++) fb_temp_ok_dc[b + j] = (int16_t)fb[j]->res1;
+        fb_temp_ok_us[b / 3] = esp_timer_get_time() | 1;   /* never 0 */
     }
 }
 
@@ -939,6 +952,25 @@ uint16_t driver_board_present_position(int ch)
 {
     if (ch < 1 || ch > 12) return 0;
     return fb_position[db_phys(ch) - 1];
+}
+
+bool driver_board_checked_temperature(int ch, float *deg_c, uint32_t *age_ms)
+{
+    if (ch < 1 || ch > 12) return false;
+    const int idx = db_phys(ch) - 1;
+    const int64_t at = fb_temp_ok_us[idx / 3];
+    if (!at) return false;
+    if (deg_c)  *deg_c  = (float)fb_temp_ok_dc[idx] * 0.1f;
+    if (age_ms) *age_ms = (uint32_t)((esp_timer_get_time() - at) / 1000);
+    return true;
+}
+
+void driver_board_refresh_stale(uint32_t max_age_ms)
+{
+    const int64_t now = esp_timer_get_time();
+    for (int b = 0; b < 4; b++)
+        if (!fb_temp_ok_us[b] || now - fb_temp_ok_us[b] > (int64_t)max_age_ms * 1000)
+            driver_board_poll_board(b);   /* resends what it already holds: nothing moves */
 }
 
 float driver_board_present_temperature(int ch)

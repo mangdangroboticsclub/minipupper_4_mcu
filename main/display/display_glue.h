@@ -29,6 +29,16 @@ void start_events();
  *  back. Nothing is shown when all is well. Call after start_face(). */
 void show_boot_check();
 
+/** Temperature watch, in the background, warnings on the screen only (the
+ *  servos are not stopped):
+ *    first minute after boot: a servo over 60 C  -> "faulty" (it heated up
+ *                             that fast from cold)
+ *    after that, always:      a servo over 80 C  -> "temperature too high",
+ *                             again every minute while it stays over 75 C
+ *  Only temperatures from replies that pass the full check count, and only
+ *  two readings in a row (1 s apart) raise a warning. Call after start_face(). */
+void start_temp_watch();
+
 /** From robot::set_master_observer -- runs on the Pi link task, so it only
  *  posts an event. */
 void on_master_changed(bool active);

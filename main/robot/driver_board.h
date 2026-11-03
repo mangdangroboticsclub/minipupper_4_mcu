@@ -201,6 +201,17 @@ uint16_t driver_board_present_position(int ch);  /* SCS scale 0..1023          *
 
 float driver_board_present_temperature(int ch);  /* degC, ch = 1..12 */
 
+/* The same temperature, but only from a reply that passed the full 12-byte
+ * check (so an SPI glitch cannot fake a hot servo), and how many ms ago it
+ * came. false = no such reply yet. ch = 1..12 (logical). */
+bool driver_board_checked_temperature(int ch, float *deg_c, uint32_t *age_ms);
+
+/* Re-read every board whose checked temperature is older than max_age_ms by
+ * resending what it already holds (nothing moves). While the gait, a skill or
+ * the Pi drives the servos the feedback is fresh anyway and this sends
+ * nothing. Used by the temperature watch, about once a second. */
+void driver_board_refresh_stale(uint32_t max_age_ms);
+
 /* Refresh the whole feedback cache (position / current / temperature) for
  * ONE board by resending its last commanded frame. board = 0..3 in
  * PHYSICAL board order (FR, FL, RR, RL). Setpoints are unchanged, so this
