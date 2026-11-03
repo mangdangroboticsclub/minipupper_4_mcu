@@ -138,6 +138,12 @@ if(CONFIG_EFUSE_CUSTOM_TABLE)
     list(APPEND sources "${mpx_efuse_table}")
 endif()
 
+# main/include only holds generated output (the eFuse table header) and is
+# git-ignored, so a fresh clone has no such folder. ESP-IDF refuses to
+# configure with a missing INCLUDE_DIRS entry, so create it here; the
+# efuse-custom-table step fills it during the build.
+file(MAKE_DIRECTORY "${CMAKE_CURRENT_LIST_DIR}/include")
+
 # ── Register component ───────────────────────────────────────
 idf_component_register(
     SRCS        ${sources}
