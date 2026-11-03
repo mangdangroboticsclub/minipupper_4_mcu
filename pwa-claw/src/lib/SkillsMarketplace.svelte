@@ -1,7 +1,9 @@
 <script>
   import { detectCurrency, setPreferredCurrency } from "./currency.js";
+  import SkillPreview from "./SkillPreview.svelte";
   import {
     listSkills,
+    getSkill,
     getSkillManifest,
     listRobotSkills,
     removeSkill,
@@ -41,6 +43,7 @@
   let searchInput = $state(null);
 
   let detailSkill = $state(null);
+  let detailData = $state(null);
   let detailManifest = $state(null);
   let detailLoading = $state(false);
   let actionInFlight = $state(null);
@@ -130,12 +133,19 @@
   // ── Detail ──
   async function openDetail(skill) {
     detailSkill = skill;
+    detailData = null;
     detailManifest = null;
     detailLoading = true;
-    try { detailManifest = await getSkillManifest(skill.id); } catch { detailManifest = null; }
+    const [detailResult, manifestResult] = await Promise.allSettled([
+      getSkill(skill.id),
+      getSkillManifest(skill.id),
+    ]);
+    if (detailSkill?.id !== skill.id) return;
+    detailData = detailResult.status === "fulfilled" ? detailResult.value : null;
+    detailManifest = manifestResult.status === "fulfilled" ? manifestResult.value : null;
     detailLoading = false;
   }
-  function closeDetail() { detailSkill = null; detailManifest = null; }
+  function closeDetail() { detailSkill = null; detailData = null; detailManifest = null; }
 
   async function handleRefund(id) {
     actionInFlight = id;
@@ -268,6 +278,11 @@
           {#if detailManifest?.description || detailSkill.description}
             <p class="d-desc">{detailManifest?.description || detailSkill.description}</p>
           {/if}
+          <SkillPreview
+            skillId={detailData?.id || detailSkill.id}
+            version={detailManifest?.version || detailData?.current_version || detailSkill.current_version || "1.0"}
+            preview={detailData?.preview}
+          />
           {#if detailManifest?.capabilities?.length}
             <section class="d-sec">
               <h2>Uses</h2>

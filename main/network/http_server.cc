@@ -4,6 +4,7 @@
 #include "network/http_display.h"
 #include "network/http_voice.h"
 #include "network/marketplace_proxy.h"
+#include "network/preview_proxy.h"
 #include "network/wifi_ap.h"
 #include "network/wifi_sta.h"
 
@@ -2920,7 +2921,7 @@ bool start_http_server()
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     // 52 register_api() + up to 12 register_static() + 2 websockets + 4
     // marketplace wildcard methods + 5 display routes (http_display.cc) + 6
-    // voice routes (http_voice.cc) = 81.
+    // voice routes (http_voice.cc) + 1 preview wildcard = 82.
     // See the note on register_uri() - this number is load-bearing, and being
     // one short deletes a route without saying so. Each slot is a pointer, so
     // the headroom is cheap.
@@ -3091,6 +3092,10 @@ bool start_http_server()
 
     // ── Register Marketplace Gateway endpoints ──
     register_api(s_server, "GET",  "/v1/gateway/config",             HTTP_GET,   api_gateway_config);
+
+    // One wildcard owns every public preview artifact; the handler's exact
+    // allowlist keeps paid skill bytecode unreachable by construction.
+    register_api(s_server, "GET", "/api/preview/*", HTTP_GET, preview_proxy_handler);
 
     // Wildcard: catch all /v1/marketplace/* paths
     {
