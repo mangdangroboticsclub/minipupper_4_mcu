@@ -6,7 +6,7 @@
     fetchPreviewManifest,
     previewFileUrl,
   } from "./previewTrace.js";
-  import { revalidatedImport } from "./lazyChunk.js";
+  import { revalidatedImport, threeModuleUrl } from "./lazyChunk.js";
 
   /** Optional detail.preview: { available:boolean, base?:string }. */
   let { skillId, version, preview } = $props();
@@ -130,7 +130,7 @@
       // so an old text/html fallback at this URL is served again. Revalidate
       // the URL first, then import it under a fresh module identity. See
       // lazyChunk.js for why this can be cached at all.
-      return revalidatedImport("/m-preview3d.js", ["/m-three.module.js"]);
+      return revalidatedImport("/m-preview3d.js", [threeModuleUrl]);
     }
   }
 
@@ -336,7 +336,23 @@
       {/if}
 
       <div class="preview-topbar">
-        <span class="preview-label"><span class="preview-dot"></span>3D PREVIEW</span>
+        <div class="preview-view-controls">
+          <div class="preview-cameras" role="group" aria-label="Camera angle">
+            {#each Object.keys(manifest.camera_presets || {}) as preset}
+              <button
+                class:active={camera === preset}
+                aria-pressed={camera === preset}
+                title={preset.replaceAll("_", " ")}
+                disabled={!ready}
+                onclick={() => selectCamera(preset)}
+              >{preset === "three_quarter" ? "¾" : preset[0].toUpperCase() + preset.slice(1)}</button>
+            {/each}
+          </div>
+          <div class="preview-follow" role="group" aria-label="Camera tracking">
+            <button class:active={follow} aria-pressed={follow} disabled={!ready} onclick={() => selectFollow(!follow)}>Follow</button>
+            <button class:active={follow && heading} aria-pressed={follow && heading} disabled={!ready || !follow} onclick={() => selectHeading(!heading)}>Heading</button>
+          </div>
+        </div>
         <div class="preview-actions">
           <button class="preview-icon" title="Restart preview" aria-label="Restart preview" disabled={!ready} onclick={restart}>
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 11a9 9 0 1 1 2.64 6.36M3 4v7h7"/></svg>
@@ -377,10 +393,10 @@
               <button class="preview-play" aria-label={playing ? "Pause preview" : "Play preview"} title="Play / pause (Space)" disabled={!ready} onclick={toggle}>
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d={playing ? "M7 5h4v14H7zm6 0h4v14h-4z" : "M8 5v14l11-7z"}/></svg>
               </button>
-              <button class="preview-step" aria-label="Go to start" title="Start (Home)" disabled={!ready} onclick={goStart}>⏮</button>
-              <button class="preview-step" aria-label="Previous frame" title="Previous frame (←)" disabled={!ready} onclick={() => stepFrames(-1)}>◀|</button>
-              <button class="preview-step" aria-label="Next frame" title="Next frame (→)" disabled={!ready} onclick={() => stepFrames(1)}>|▶</button>
-              <button class="preview-step" aria-label="Go to end" title="End (End)" disabled={!ready} onclick={goEnd}>⏭</button>
+              <button class="preview-step" aria-label="Go to start" title="Start (Home)" disabled={!ready} onclick={goStart}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 5v14M19 5 9 12l10 7V5z"/></svg></button>
+              <button class="preview-step" aria-label="Previous frame" title="Previous frame (←)" disabled={!ready} onclick={() => stepFrames(-1)}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 5v14M19 5l-9 7 9 7V5z"/></svg></button>
+              <button class="preview-step" aria-label="Next frame" title="Next frame (→)" disabled={!ready} onclick={() => stepFrames(1)}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 5v14M5 5l9 7-9 7V5z"/></svg></button>
+              <button class="preview-step" aria-label="Go to end" title="End (End)" disabled={!ready} onclick={goEnd}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 5v14M5 5l10 7-10 7V5z"/></svg></button>
             </div>
             <div class="preview-rates" role="group" aria-label="Playback speed">
               {#each rates as r}
@@ -393,31 +409,25 @@
       {/if}
     </div>
 
-    <div class="preview-footer">
-      <div class="preview-cameras" aria-label="Camera angle">
-        {#each Object.keys(manifest.camera_presets || {}) as preset}
-          <button class:active={camera === preset} aria-pressed={camera === preset} disabled={!ready} onclick={() => selectCamera(preset)}>{preset.replaceAll("_", " ").replace(/^\w/, (c) => c.toUpperCase())}</button>
-        {/each}
-      </div>
-      <div class="preview-follow" role="group" aria-label="Camera tracking">
-        <button class:active={follow} aria-pressed={follow} disabled={!ready} onclick={() => selectFollow(!follow)}>Follow</button>
-        <button class:active={follow && heading} aria-pressed={follow && heading} disabled={!ready || !follow} onclick={() => selectHeading(!heading)}>Heading</button>
-      </div>
-      <span class="preview-duration">{seconds}s · loops</span>
-    </div>
     {#if manifest.preview.speed > 1 && rate === 1}<p class="preview-note">Real-time playback. Select {manifest.preview.speed}× for the smoother baked preview.</p>{/if}
   </section>
 {/if}
 
 <style>
-  .preview { margin: 16px 0; }
+  .preview {
+    --preview-accent: #f5c20d;
+    --preview-panel: rgba(10,30,58,.78);
+    --preview-line: rgba(199,230,255,.18);
+    margin: 16px 0;
+  }
   .preview-stage {
     position: relative;
     height: 340px;
     overflow: hidden;
-    border-radius: 18px;
-    background: #191a17;
-    box-shadow: inset 0 0 0 1px rgba(255,255,255,.08);
+    border: 1px solid rgba(127,157,192,.28);
+    border-radius: 16px;
+    background: #0a1e3a;
+    box-shadow: 0 10px 30px rgba(10,30,58,.12), inset 0 0 0 1px rgba(255,255,255,.03);
     isolation: isolate;
   }
   .preview-stage :global(canvas) { display: block; width: 100%; height: 100%; }
@@ -429,38 +439,50 @@
     left: 0;
     right: 0;
     display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 14px;
+    align-items: flex-start;
+    gap: 8px;
+    padding: 12px;
     pointer-events: none;
   }
-  .preview-label {
-    display: inline-flex;
-    align-items: center;
-    gap: 7px;
-    padding: 7px 10px;
-    border-radius: 999px;
-    color: rgba(255,255,255,.88);
-    background: rgba(20,21,18,.56);
-    backdrop-filter: blur(12px);
-    font-size: 10px;
-    font-weight: 750;
-    letter-spacing: .13em;
+  .preview-view-controls { display: flex; flex-wrap: wrap; gap: 6px; min-width: 0; pointer-events: auto; }
+  .preview-cameras, .preview-follow {
+    display: flex;
+    gap: 2px;
+    padding: 3px;
+    border: 1px solid var(--preview-line);
+    border-radius: 8px;
+    background: var(--preview-panel);
+    box-shadow: 0 4px 16px rgba(0,0,0,.12);
+    backdrop-filter: blur(14px);
   }
-  .preview-dot { width: 6px; height: 6px; border-radius: 50%; background: #f5d90a; box-shadow: 0 0 0 3px rgba(245,217,10,.15); }
-  .preview-actions { display: flex; gap: 7px; pointer-events: auto; }
+  .preview-cameras button, .preview-follow button {
+    flex: 0 0 auto;
+    min-width: 30px;
+    padding: 6px 8px;
+    border: 0;
+    border-radius: 5px;
+    color: rgba(231,240,250,.68);
+    background: transparent;
+    font-size: 10px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .preview-cameras button:hover, .preview-follow button:hover { color: #fff; background: rgba(255,255,255,.07); }
+  .preview-cameras button.active, .preview-follow button.active { color: #0a1e3a; background: var(--preview-accent); box-shadow: none; }
+  .preview-cameras button:disabled, .preview-follow button:disabled { cursor: default; opacity: .4; }
+  .preview-actions { display: flex; flex: 0 0 auto; gap: 6px; margin-left: auto; pointer-events: auto; }
   .preview-icon, .preview-play {
     display: grid;
     place-items: center;
-    border: 0;
+    border: 1px solid var(--preview-line);
     color: #fff;
-    background: rgba(20,21,18,.6);
-    backdrop-filter: blur(12px);
+    background: var(--preview-panel);
+    backdrop-filter: blur(14px);
     cursor: pointer;
   }
-  .preview-icon { width: 34px; height: 34px; border-radius: 50%; }
-  .preview-icon svg { width: 17px; height: 17px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
-  .preview-icon:hover, .preview-play:hover, .preview-step:hover { background: rgba(20,21,18,.85); }
+  .preview-icon { width: 34px; height: 34px; padding: 0; border-radius: 8px; }
+  .preview-icon svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+  .preview-icon:hover, .preview-step:hover { background: rgba(26,54,89,.94); }
   .preview-icon:disabled, .preview-play:disabled, .preview-step:disabled { opacity: .35; cursor: default; }
   .preview-transport {
     position: absolute;
@@ -473,24 +495,27 @@
     align-items: stretch;
     gap: 7px;
     padding: 10px 12px;
-    border: 1px solid rgba(255,255,255,.1);
-    border-radius: 14px;
-    background: rgba(20,21,18,.72);
+    border: 1px solid var(--preview-line);
+    border-radius: 12px;
+    background: var(--preview-panel);
+    box-shadow: 0 8px 24px rgba(0,0,0,.16);
     backdrop-filter: blur(16px);
     color: #fff;
   }
-  .preview-play { flex: 0 0 auto; width: 34px; height: 34px; padding: 0; border-radius: 50%; background: #f5d90a; color: #191a17; }
-  .preview-play:hover { background: #ffe72a; }
-  .preview-play svg { width: 18px; height: 18px; fill: currentColor; }
-  .preview-controls { display: flex; align-items: center; gap: 10px; }
+  .preview-play { flex: 0 0 auto; width: 34px; height: 34px; padding: 0; border-color: var(--preview-accent); border-radius: 7px; background: var(--preview-accent); color: #0a1e3a; }
+  .preview-play:hover { background: #ffda32; }
+  .preview-play svg { width: 17px; height: 17px; fill: currentColor; }
+  .preview-controls { display: flex; align-items: center; gap: 9px; }
   .preview-buttons { display: flex; flex: 0 0 auto; align-items: center; gap: 4px; }
-  .preview-step { width: 28px; height: 30px; padding: 0; border: 0; border-radius: 7px; color: #fff; background: rgba(255,255,255,.08); font-size: 11px; cursor: pointer; }
-  .preview-rates { display: flex; flex: 1; justify-content: center; gap: 3px; min-width: 0; overflow-x: auto; scrollbar-width: none; }
+  .preview-step { display: grid; place-items: center; width: 28px; height: 30px; padding: 0; border: 1px solid rgba(199,230,255,.1); border-radius: 6px; color: rgba(255,255,255,.82); background: rgba(255,255,255,.04); cursor: pointer; }
+  .preview-step svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+  .preview-rates { display: flex; flex: 1; justify-content: center; gap: 2px; min-width: 0; overflow-x: auto; scrollbar-width: none; }
   .preview-rates::-webkit-scrollbar { display: none; }
-  .preview-rates button { flex: 0 0 auto; padding: 5px 8px; border: 0; border-radius: 6px; color: rgba(255,255,255,.62); background: transparent; font-size: 10px; cursor: pointer; }
-  .preview-rates button.active { color: #191a17; background: #f5d90a; font-weight: 750; }
+  .preview-rates button { flex: 0 0 auto; padding: 5px 8px; border: 0; border-radius: 5px; color: rgba(231,240,250,.58); background: transparent; font-size: 10px; cursor: pointer; }
+  .preview-rates button:hover { color: #fff; }
+  .preview-rates button.active { color: #0a1e3a; background: var(--preview-accent); font-weight: 750; }
   .preview-rates button:disabled { opacity: .35; cursor: default; }
-  .preview-clock { flex: 0 0 auto; min-width: 116px; text-align: right; color: rgba(255,255,255,.5); font-size: 10px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .preview-clock { flex: 0 0 auto; min-width: 116px; text-align: right; color: rgba(231,240,250,.5); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; font-variant-numeric: tabular-nums; white-space: nowrap; }
   .preview-clock strong { color: #fff; font-weight: 650; }
   .preview-scrubber { width: 100%; min-width: 0; }
   .preview-scrubber input {
@@ -503,11 +528,11 @@
     background: transparent;
     cursor: pointer;
   }
-  .preview-scrubber input::-webkit-slider-runnable-track { height: 3px; border-radius: 3px; background: linear-gradient(to right, #f5d90a var(--progress), rgba(255,255,255,.25) var(--progress)); }
-  .preview-scrubber input::-webkit-slider-thumb { width: 11px; height: 11px; margin-top: -4px; appearance: none; border: 0; border-radius: 50%; background: #fff; box-shadow: 0 1px 4px #0008; }
-  .preview-scrubber input::-moz-range-track { height: 3px; border-radius: 3px; background: rgba(255,255,255,.25); }
-  .preview-scrubber input::-moz-range-progress { height: 3px; background: #f5d90a; }
-  .preview-scrubber input::-moz-range-thumb { width: 11px; height: 11px; border: 0; border-radius: 50%; background: #fff; }
+  .preview-scrubber input::-webkit-slider-runnable-track { height: 3px; border-radius: 3px; background: linear-gradient(to right, var(--preview-accent) var(--progress), rgba(199,230,255,.2) var(--progress)); }
+  .preview-scrubber input::-webkit-slider-thumb { width: 10px; height: 14px; margin-top: -5.5px; appearance: none; border: 0; border-radius: 2px; background: var(--preview-accent); box-shadow: 0 0 0 2px rgba(10,30,58,.65); }
+  .preview-scrubber input::-moz-range-track { height: 3px; border-radius: 3px; background: rgba(199,230,255,.2); }
+  .preview-scrubber input::-moz-range-progress { height: 3px; background: var(--preview-accent); }
+  .preview-scrubber input::-moz-range-thumb { width: 10px; height: 14px; border: 0; border-radius: 2px; background: var(--preview-accent); }
   .preview-scrubber input:disabled { cursor: default; opacity: .45; }
 
   .preview-status {
@@ -522,7 +547,7 @@
     background: rgba(15,16,14,.18);
     font-size: 12px;
   }
-  .preview-spinner { width: 17px; height: 17px; border: 2px solid rgba(255,255,255,.25); border-top-color: #f5d90a; border-radius: 50%; animation: spin .7s linear infinite; }
+  .preview-spinner { width: 17px; height: 17px; border: 2px solid rgba(255,255,255,.25); border-top-color: var(--preview-accent); border-radius: 50%; animation: spin .7s linear infinite; }
   .preview-error {
     position: absolute;
     z-index: 3;
@@ -535,49 +560,46 @@
     padding: 64px 28px 28px;
     text-align: center;
     color: #fff;
-    background: rgba(20,21,18,.72);
+    background: rgba(10,30,58,.84);
     backdrop-filter: blur(5px);
   }
   .preview-error strong { font-size: 15px; }
   .preview-error span { max-width: 280px; color: rgba(255,255,255,.65); font-size: 12px; line-height: 1.45; }
-  .preview-error button { margin-top: 5px; padding: 8px 15px; border: 0; border-radius: 999px; background: #f5d90a; color: #191a17; font-weight: 700; cursor: pointer; }
-  .preview-footer { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 10px; }
-  .preview-cameras { display: flex; flex: 1; min-width: 0; gap: 4px; padding: 3px; overflow-x: auto; border-radius: 10px; background: #eeeae1; scrollbar-width: none; }
-  .preview-cameras::-webkit-scrollbar { display: none; }
-  .preview-cameras button { flex: 0 0 auto; padding: 6px 10px; border: 0; border-radius: 7px; background: transparent; color: #827f76; font-size: 11px; cursor: pointer; }
-  .preview-cameras button.active { color: #34342e; background: #fff; box-shadow: 0 1px 4px #29291b12; font-weight: 700; }
-  .preview-cameras button:disabled { cursor: default; opacity: .55; }
-  .preview-follow { display: flex; flex: 0 0 auto; gap: 3px; padding: 3px; border-radius: 10px; background: #eeeae1; }
-  .preview-follow button { padding: 6px 9px; border: 0; border-radius: 7px; color: #827f76; background: transparent; font-size: 11px; cursor: pointer; }
-  .preview-follow button.active { color: #34342e; background: #fff; box-shadow: 0 1px 4px #29291b12; font-weight: 700; }
-  .preview-follow button:disabled { cursor: default; opacity: .45; }
-  .preview-duration { flex: 0 0 auto; color: #a09b90; font-size: 10px; white-space: nowrap; }
-  .preview button:focus-visible, .preview input:focus-visible, .preview :global(canvas):focus-visible { outline: 2px solid #f5d90a; outline-offset: 2px; }
+  .preview-error button { margin-top: 5px; padding: 8px 15px; border: 0; border-radius: 7px; background: var(--preview-accent); color: #0a1e3a; font-weight: 700; cursor: pointer; }
+  .preview button:focus-visible, .preview input:focus-visible, .preview :global(canvas):focus-visible { outline: 2px solid var(--preview-accent); outline-offset: 2px; }
   .preview-note { margin: 8px 2px 0; color: #a09b90; font-size: 10px; }
-  .preview.expanded, .preview:fullscreen { position: fixed; inset: 0; z-index: 1000; display: flex; flex-direction: column; justify-content: center; margin: 0; padding: 16px; background: #191a17; }
+  .preview.expanded, .preview:fullscreen { position: fixed; inset: 0; z-index: 1000; display: flex; flex-direction: column; justify-content: center; margin: 0; padding: 16px; background: #061426; }
   .preview.expanded .preview-stage, .preview:fullscreen .preview-stage { flex: 1; width: 100%; height: auto; min-height: 0; border-radius: 0; }
   .preview.expanded .preview-transport, .preview:fullscreen .preview-transport { left: 24px; right: 24px; bottom: 24px; }
-  .preview.expanded .preview-footer, .preview:fullscreen .preview-footer { flex: 0 0 auto; }
-  .preview.expanded .preview-duration, .preview:fullscreen .preview-duration { display: block; color: rgba(255,255,255,.55); }
   @keyframes spin { to { transform: rotate(360deg); } }
   @media (min-width: 700px) { .preview-stage { height: 420px; } }
+  @media (max-width: 600px) {
+    .preview-topbar { gap: 6px; padding: 9px; }
+    .preview-view-controls { gap: 5px; }
+    .preview-cameras button, .preview-follow button { min-width: 26px; padding: 5px 6px; font-size: 9px; }
+    .preview-icon { width: 31px; height: 31px; }
+  }
   @media (max-width: 480px) {
-    .preview-duration { display: none; }
     .preview-controls { flex-wrap: wrap; gap: 6px; }
     .preview-rates { order: 3; flex-basis: 100%; justify-content: flex-start; }
     .preview-clock { margin-left: auto; }
-    .preview-footer { flex-wrap: wrap; }
   }
   @media (max-width: 380px) {
-    .preview-stage { height: 300px; }
-    .preview-transport { gap: 8px; padding: 8px; }
-    .preview-cameras button { padding: 6px 8px; }
+    .preview-stage { height: 320px; }
+    .preview-transport { left: 8px; right: 8px; bottom: 8px; gap: 8px; padding: 8px; }
+    .preview-actions { position: absolute; top: 9px; right: 9px; }
+    .preview-view-controls { box-sizing: border-box; width: 100%; padding-right: 100px; }
+    .preview-cameras { min-width: 0; max-width: 100%; overflow-x: auto; scrollbar-width: none; }
+    .preview-cameras::-webkit-scrollbar { display: none; }
   }
   @media (pointer: coarse) {
     .preview-icon, .preview-play { width: 44px; height: 44px; }
     .preview-step { width: 44px; height: 44px; }
     .preview-rates button { min-width: 40px; min-height: 44px; }
     .preview-cameras button, .preview-follow button { min-height: 44px; }
+  }
+  @media (max-width: 480px) and (pointer: coarse) {
+    .preview-stage { height: 420px; }
   }
   @media (prefers-reduced-motion: reduce) { .preview-spinner { animation-duration: 1.5s; } }
 </style>

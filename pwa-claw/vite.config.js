@@ -9,8 +9,23 @@ import { svelte } from "@sveltejs/vite-plugin-svelte";
 const buildId =
   process.env.MPX_BUILD || new Date().toISOString().replace(/[-:TZ.]/g, "").slice(0, 12);
 
+// Fixed chunk filenames are required by the firmware, but their exported
+// minified names can change whenever a viewer imports another Three export.
+// Stamp the shared dependency with the build ID: a newly loaded viewer then
+// cannot link against an older m-three.module.js already in the browser's
+// module map (HTTP revalidation alone cannot replace that evaluated module).
+const versionedThreeChunk = {
+  name: "mpx-versioned-three-chunk",
+  renderChunk(code) {
+    const url = `./m-three.module.js?v=${encodeURIComponent(buildId)}`;
+    // Rollup emits single quotes; Terser may later rewrite them as double.
+    const stamped = code.replace(/(["'])\.\/m-three\.module\.js\1/g, JSON.stringify(url));
+    return stamped === code ? null : { code: stamped, map: null };
+  },
+};
+
 export default defineConfig({
-  plugins: [svelte()],
+  plugins: [svelte(), versionedThreeChunk],
 
   define: {
     __MPX_BUILD__: JSON.stringify(buildId),

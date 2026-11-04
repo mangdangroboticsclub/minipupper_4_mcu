@@ -141,6 +141,13 @@ async function fetchWithRetry(url, read, { signal, allowNotFound = false } = {})
   throw new Error(`Preview file failed: ${url}`);
 }
 
+export const DEFAULT_PREVIEW_SKU = "sku_1";
+
+/** MP4 / Mini Pupper 4 is the fallback; a valid manifest SKU always wins. */
+export function resolvePreviewSku(sku) {
+  return sku === "sku_1" || sku === "sku_2" ? sku : DEFAULT_PREVIEW_SKU;
+}
+
 function fetchBytes(url, signal) {
   return fetchWithRetry(url, (res) => res.arrayBuffer(), { signal });
 }
@@ -152,7 +159,7 @@ export async function fetchPreviewManifest(skillId, version, { base, signal } = 
   if (res.status === 404) return null;
   const manifest = await res.json();
   if (manifest.preview_format !== 2) throw new Error(`Unsupported preview format: ${manifest.preview_format}`);
-  return manifest;
+  return { ...manifest, sku: resolvePreviewSku(manifest.sku) };
 }
 
 /**
@@ -161,8 +168,9 @@ export async function fetchPreviewManifest(skillId, version, { base, signal } = 
  */
 export async function fetchPreview(skillId, version, { base, manifest, signal } = {}) {
   const load = async (requestBase) => {
-    const currentManifest = manifest || await fetchPreviewManifest(skillId, version, { base: requestBase, signal });
-    if (!currentManifest) return null;
+    const requestedManifest = manifest || await fetchPreviewManifest(skillId, version, { base: requestBase, signal });
+    if (!requestedManifest) return null;
+    const currentManifest = { ...requestedManifest, sku: resolvePreviewSku(requestedManifest.sku) };
     const glb = currentManifest.files?.find((f) => f.mime === "model/gltf-binary")?.name || `${currentManifest.sku}.glb`;
     const traceFile = currentManifest.trace?.file || "trace.bin.gz";
     // The relay has one uncached-download slot. Serial requests avoid a cold

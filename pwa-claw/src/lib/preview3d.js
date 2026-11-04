@@ -4,19 +4,42 @@
  * No animation or WebGL work begins until the detail view creates this module.
  */
 import {
-  WebGLRenderer, Scene, PerspectiveCamera, HemisphereLight, DirectionalLight,
-  Mesh, CircleGeometry, MeshStandardMaterial, Vector3, Quaternion,
+  WebGLRenderer, Scene, PerspectiveCamera, AmbientLight, DirectionalLight,
+  Mesh, PlaneGeometry, GridHelper, MeshBasicMaterial, Vector3, Quaternion,
+  Color, Fog, ColorManagement, ACESFilmicToneMapping, sRGBEncoding,
 } from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { playbackStride } from "./previewTrace.js";
+import { addPreviewScreen } from "./previewScreen.js";
 
 const UP = new Vector3(0, 1, 0);
+const FLOOR_SIZE = 4;
+const SCENE = {
+  background: 0x0a1e3a,
+  // Unlit drafting-floor equivalent of the tester's lit floor under three r181.
+  floor: 0x1b2840,
+  cell: 0x7f9dc0,
+  section: 0xc7e6ff,
+};
 const DEFAULT_HERO = [0.42, 0.34, 0.22];
 const EASE_S = 0.12;
 const SNAP_M = 0.6;
 const SNAP_RAD = Math.PI / 3;
 const wrapAngle = (angle) => Math.atan2(Math.sin(angle), Math.cos(angle));
+
+// three 0.149 converts hex colors at construction time. Scope the modern
+// behavior to synchronous setup so opening this lazy view cannot affect other
+// Three scenes, and restore it before the asynchronous GLTF parse.
+function withModernColors(build) {
+  const previous = ColorManagement.legacyMode;
+  ColorManagement.legacyMode = false;
+  try {
+    return build();
+  } finally {
+    ColorManagement.legacyMode = previous;
+  }
+}
 
 /** [forward, left, up] in robot-heading coordinates -> three world space. */
 function cameraOffset(offset, yaw) {
@@ -74,24 +97,50 @@ export async function init(container, { glbArrayBuffer, trace, manifest, onTime,
     canvas.remove();
     throw error;
   }
-  renderer.setClearColor(0x191a17);
   renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
-  renderer.outputEncoding = 1501; // THREE.sRGBEncoding (three 0.149)
+  renderer.outputEncoding = sRGBEncoding;
+  renderer.toneMapping = ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 0.8;
 
+  // Match the skill tester's blueprint workbench: a large matte floor, two
+  // drafting grids and fog at the horizon. A finite circular floor made the
+  // marketplace preview look like a robot floating over an olive-green dome.
   const scene = new Scene();
-  const camera = new PerspectiveCamera(40, 1, 0.01, 14);
+  const camera = new PerspectiveCamera(32, 1, 0.01, 14);
   camera.up.copy(UP);
-  scene.add(new HemisphereLight(0xffffff, 0x24251f, 1.0));
-  const key = new DirectionalLight(0xffffff, 0.85);
-  key.position.set(0.5, 1.2, 0.7);
-  scene.add(key);
+  const { ground, cells, sections } = withModernColors(() => {
+    renderer.setClearColor(SCENE.background);
+    scene.background = new Color(SCENE.background);
+    scene.fog = new Fog(SCENE.background, 2.4, 6.0);
+    scene.add(new AmbientLight(0xffffff, 0.6));
+    const key = new DirectionalLight(0xffffff, 1.6);
+    key.position.set(1.6, 2.4, 1.2);
+    const fill = new DirectionalLight(0xffffff, 0.4);
+    fill.position.set(-1.8, 1.2, -0.8);
+    const rim = new DirectionalLight(0x7fe3ff, 0.55);
+    rim.position.set(-0.6, 0.9, -2.0);
+    scene.add(key, fill, rim);
 
-  const groundGeometry = new CircleGeometry(1.4, 64);
-  const groundMaterial = new MeshStandardMaterial({ color: 0x24251f, roughness: 1 });
-  const ground = new Mesh(groundGeometry, groundMaterial);
-  ground.rotation.x = -Math.PI / 2;
-  ground.position.y = -0.001;
-  scene.add(ground);
+    const ground = new Mesh(
+      new PlaneGeometry(FLOOR_SIZE, FLOOR_SIZE),
+      new MeshBasicMaterial({ color: SCENE.floor, toneMapped: false }),
+    );
+    ground.rotation.x = -Math.PI / 2;
+    ground.position.y = -0.0005;
+    scene.add(ground);
+
+    const cells = new GridHelper(FLOOR_SIZE, FLOOR_SIZE / 0.1, SCENE.cell, SCENE.cell);
+    const sections = new GridHelper(FLOOR_SIZE, FLOOR_SIZE / 0.5, SCENE.section, SCENE.section);
+    for (const grid of [cells, sections]) {
+      grid.material.transparent = true;
+      grid.material.opacity = grid === cells ? 0.28 : 0.55;
+      grid.material.depthWrite = false;
+      grid.material.toneMapped = false;
+      grid.position.y = 0.0005;
+      scene.add(grid);
+    }
+    return { ground, cells, sections };
+  });
 
   let model;
   try {
@@ -99,10 +148,13 @@ export async function init(container, { glbArrayBuffer, trace, manifest, onTime,
       new GLTFLoader().parse(glbArrayBuffer, "", resolve, reject);
     });
     model = gltf.scene;
+    withModernColors(() => addPreviewScreen(model, manifest.sku));
     scene.add(model);
   } catch (error) {
-    groundGeometry.dispose();
-    groundMaterial.dispose();
+    if (model) disposeObject(model);
+    disposeObject(ground);
+    disposeObject(cells);
+    disposeObject(sections);
     renderer.dispose();
     canvas.remove();
     throw error;
@@ -111,8 +163,9 @@ export async function init(container, { glbArrayBuffer, trace, manifest, onTime,
   const base = model.getObjectByName(manifest.rig?.base_node || "base");
   if (!base) {
     disposeObject(model);
-    groundGeometry.dispose();
-    groundMaterial.dispose();
+    disposeObject(ground);
+    disposeObject(cells);
+    disposeObject(sections);
     renderer.dispose();
     canvas.remove();
     throw new Error(`Preview rig has no ${manifest.rig?.base_node || "base"} node`);
@@ -311,8 +364,9 @@ export async function init(container, { glbArrayBuffer, trace, manifest, onTime,
       ro.disconnect();
       controls.dispose();
       disposeObject(model);
-      groundGeometry.dispose();
-      groundMaterial.dispose();
+      disposeObject(ground);
+      disposeObject(cells);
+      disposeObject(sections);
       renderer.renderLists.dispose();
       renderer.dispose();
       renderer.forceContextLoss();

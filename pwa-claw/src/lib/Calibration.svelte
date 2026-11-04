@@ -1,5 +1,5 @@
 <script>
-  import { revalidatedImport } from "./lazyChunk.js";
+  import { revalidatedImport, threeModuleUrl } from "./lazyChunk.js";
 
   let { onBack } = $props();
 
@@ -52,7 +52,7 @@
         if (!import.meta.env.PROD) throw error;
         // Same cached-HTML-fallback trap as the skill preview chunk; see
         // lazyChunk.js.
-        return revalidatedImport("/m-pupper3d.js", ["/m-three.module.js"]);
+        return revalidatedImport("/m-pupper3d.js", [threeModuleUrl]);
       })
       .then(({ createPupperView }) => createPupperView(canvasEl, "/pupper_model.json", {
         onPickLeg: (leg) => selectLeg(leg),

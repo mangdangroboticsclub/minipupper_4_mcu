@@ -27,6 +27,12 @@
 //
 // Cost: one revalidation round trip, only after an import has already failed.
 
+// Must match vite.config.js's renderChunk stamp. Besides bypassing HTTP
+// caches, the build query gives each deployment's shared Three module a new
+// browser module-map identity, so its minified exports cannot be mixed with a
+// previous deployment's m-preview3d.js or m-pupper3d.js.
+export const threeModuleUrl = `/m-three.module.js?v=${encodeURIComponent(__MPX_BUILD__)}`;
+
 const importFresh = (url) => import(/* @vite-ignore */ `${url}#retry=${Date.now()}`);
 
 /** Re-fetch `url` past the HTTP cache; throw if what comes back is not JS. */
