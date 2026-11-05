@@ -69,12 +69,12 @@ export default defineConfig({
     // Override the target with:  ROBOT_HOST=192.168.x.x npm run dev
     proxy: {
       "/v1": {
-        target: `http://${process.env.ROBOT_HOST || "192.168.1.107"}`,
+        target: `http://${process.env.ROBOT_HOST || "192.168.1.112"}`,
         changeOrigin: true,
         ws: true,
       },
       "/api": {
-        target: `http://${process.env.ROBOT_HOST || "192.168.1.107"}`,
+        target: `http://${process.env.ROBOT_HOST || "192.168.1.112"}`,
         changeOrigin: true,
       },
     },
