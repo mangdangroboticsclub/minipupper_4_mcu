@@ -27,6 +27,7 @@
     LAK: 0, MGA: 0, PYG: 0, RWF: 0, UGX: 0, UYI: 0, VND: 0, VUV: 0, XAF: 0,
     XOF: 0, XPF: 0,
     BHD: 3, IQD: 3, JOD: 3, KWD: 3, LYD: 3, OMR: 3, TND: 3,
+    CLF: 4, UYW: 4,
   };
   const DISPLAY_CURRENCIES = ["USD", "HKD", "CNY", "EUR", "GBP", "JPY", "SGD"];
   const PLACEHOLDER_TAGS = {
@@ -261,7 +262,23 @@
 </script>
 
 {#snippet icon(s, size)}
-  <span class="app-ico" class:motion={typeOf(s) === "wasm"} style="--s: {size}px" aria-hidden="true">
+  <span
+    class="app-ico"
+    class:motion={typeOf(s) === "wasm"}
+    class:has-image={Boolean(s?.icon_url)}
+    style="--s: {size}px"
+    aria-hidden="true"
+  >
+    {#if s?.icon_url}
+      <img
+        src={s.icon_url}
+        alt=""
+        loading="lazy"
+        referrerpolicy="no-referrer"
+        onload={(e) => e.currentTarget.parentElement.classList.remove("broken")}
+        onerror={(e) => e.currentTarget.parentElement.classList.add("broken")}
+      >
+    {/if}
     <i></i><i></i>
   </span>
 {/snippet}
@@ -302,7 +319,7 @@
           </button>
         </div>
         <div class="d-hero">
-          {@render icon(detailSkill, 108)}
+          {@render icon({ ...detailSkill, icon_url: detailSkill.icon_url || detailManifest?.icon_url }, 108)}
           <div class="d-txt">
             <h1>{detailManifest?.name || detailSkill.title}</h1>
             <span class="d-sub">{author(detailSkill)} · v{detailManifest?.version || detailSkill.current_version || "1.0"}</span>
@@ -469,7 +486,7 @@
                 <div><span class="kicker">MangDang featured</span><p class="feat-intro">Best new highlights this week</p></div>
                 <button type="button" class="feat" class:motion={kind === "wasm"} onclick={() => openDetail(featured)}>
                   <span class="feat-label">Feature preview</span>
-                  <span class="feat-eyes" aria-hidden="true"><i></i><i></i></span>
+                  <span class="feat-art">{@render icon(featured, 96)}</span>
                   <span class="feat-foot">
                     <span class="feat-txt">
                       <span class="feat-name">{featured.title}</span>
@@ -584,9 +601,9 @@
   .feat::after { content: ""; position: absolute; width: 210px; height: 210px; top: 24px; right: -74px; border: 1px solid rgba(17,17,17,.1); border-radius: 50%; pointer-events: none; }
   .feat.motion { background: #CFE3FF; box-shadow: 0 8px 26px rgba(31, 95, 191, 0.1); }
   .feat-label { align-self: center; font-size: 10px; font-weight: 800; letter-spacing: 0.15em; text-transform: uppercase; opacity: 0.65; }
-  .feat-eyes { display: flex; gap: 13px; align-items: center; justify-content: center; height: 96px; }
-  .feat-eyes i { width: 34px; height: 78px; border-radius: 12px; background: var(--ink); transform-origin: 50% 60%; animation: blink 4.2s ease-in-out infinite; }
-  .feat-eyes i + i { animation-delay: 0.05s; }
+  .feat-art { display: flex; align-items: center; justify-content: center; height: 96px; }
+  .feat-art .app-ico i { width: 20px; height: 56px; border-radius: 8px; transform-origin: 50% 60%; animation: blink 4.2s ease-in-out infinite; }
+  .feat-art .app-ico i + i { animation-delay: 0.05s; }
   @keyframes blink { 0%, 94%, 100% { transform: scaleY(1); } 97% { transform: scaleY(0.1); } }
   .feat-foot { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; padding-right: 88px; }
   .feat-txt { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
@@ -629,8 +646,13 @@
   .app-ico {
     width: var(--s); height: var(--s); border-radius: calc(var(--s) * 0.27); flex-shrink: 0;
     background: var(--mpx-yellow); display: flex; align-items: center; justify-content: center; gap: calc(var(--s) * 0.07);
+    overflow: hidden;
   }
   .app-ico.motion { background: #CFE3FF; }
+  .app-ico img { width: 100%; height: 100%; object-fit: cover; }
+  .app-ico.has-image:not(.broken) { background: var(--ground); }
+  .app-ico.has-image:not(.broken) i { display: none; }
+  .app-ico:global(.broken) img { display: none; }
   .app-ico i { width: calc(var(--s) * 0.12); height: calc(var(--s) * 0.28); border-radius: calc(var(--s) * 0.05); background: var(--ink); }
 
   .get {
