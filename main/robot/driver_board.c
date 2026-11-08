@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>    /* qsort - boot check */
 #include <string.h>
+#include "sdkconfig.h"
 #include "driver/spi_master.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
@@ -83,6 +84,21 @@ float driver_board_get_scale_dd(void){ return db_scale_dd; }
 #define SPI_MASTER_MOSI  SERVO_SPI_MOSI_PIN
 #define SPI_MASTER_MISO  SERVO_SPI_MISO_PIN
 #define SPI_MASTER_CLK   SERVO_SPI_CLK_PIN
+/* SPI clock for the four AT32 boards, and the drive strength of the ESP32's
+ * outputs on that bus: menuconfig APP_SERVO_SPI_KHZ (default 4000) and
+ * APP_SERVO_SPI_DRIVE (default 1). Was 12 MHz at the default drive (2). 4 MHz
+ * (2026-11-06): CN3's chip select (GPIO15) sits right next to the clock
+ * (GPIO16) on the ESP32-S3 module, and the CN3 servos flickered; a slower
+ * clock and a weaker drive give the edges less to couple. Until the build
+ * reruns menuconfig's step a new option is missing: its default. */
+#ifndef CONFIG_APP_SERVO_SPI_KHZ
+#define CONFIG_APP_SERVO_SPI_KHZ 4000
+#endif
+#ifndef CONFIG_APP_SERVO_SPI_DRIVE
+#define CONFIG_APP_SERVO_SPI_DRIVE 1
+#endif
+#define DB_SPI_HZ        (CONFIG_APP_SERVO_SPI_KHZ * 1000)
+#define DB_SPI_DRIVE     ((gpio_drive_cap_t)CONFIG_APP_SERVO_SPI_DRIVE)
 /* Which connector each leg is on lives in the board header, not here — see
  * the note above SERVO_SPI_CS_FR_PIN in robot/board_config.h for why these were
  * wrong. Board index follows the device order below, not the CS number:
@@ -93,6 +109,16 @@ float driver_board_get_scale_dd(void){ return db_scale_dd; }
 #define SPI_MASTER_CS2   SERVO_SPI_CS_RL_PIN   /* CN6 - left  rear  */
 #define SPI_MASTER_CS3   SERVO_SPI_CS_RR_PIN   /* CN3 - right rear  */
 #define POWER_EN_GPIO    SERVO_POWER_EN_PIN
+
+/* every line the ESP32 drives on the servo bus at DB_SPI_DRIVE; after
+ * spi_bus_add_device(), which sets the chip-select pins up */
+static void db_apply_drive(void)
+{
+    static const gpio_num_t pins[] = {
+        SPI_MASTER_CLK, SPI_MASTER_MOSI, SPI_MASTER_CS0, SPI_MASTER_CS1, SPI_MASTER_CS2, SPI_MASTER_CS3 };
+    for (size_t i = 0; i < sizeof pins / sizeof pins[0]; i++)
+        gpio_set_drive_capability(pins[i], DB_SPI_DRIVE);
+}
 
 /* ---- on-the-wire protocol (identical to AT32 spi_command_frame) ---- */
 #define START_FIELD  0xA5A5
@@ -284,11 +310,11 @@ bool driver_board_init(void)
         return false;
     }
 
-    /* 4 driver-board devices (12 MHz, mode 0) */
+    /* 4 driver-board devices (DB_SPI_HZ, mode 0) */
     spi_device_interface_config_t dev = {
         .mode           = 0,
         .duty_cycle_pos = 128,
-        .clock_speed_hz = 12 * 1000 * 1000,   /* 15 MHz max */
+        .clock_speed_hz = DB_SPI_HZ,          /* 15 MHz max, see DB_SPI_HZ */
         .queue_size     = 2,
     };
     struct { int cs; spi_device_handle_t *out; const char *name; } devs[4] = {
@@ -306,6 +332,9 @@ bool driver_board_init(void)
             return false;
         }
     }
+    db_apply_drive();
+    ESP_LOGI(TAG, "driver board SPI: %d kHz, output drive %d (0 = softest .. 3)",
+             DB_SPI_HZ / 1000, (int)DB_SPI_DRIVE);
 
     driver_board_power(true);
     ESP_LOGD(TAG, "driver board SPI init OK (4 boards, 12 servos, variant %d)",
@@ -1095,6 +1124,7 @@ static bool bc_reattach(int hz)
         dev.spics_io_num = devs[i].cs;
         ok &= spi_bus_add_device(SPI_MASTER_ID, &dev, devs[i].out) == ESP_OK;
     }
+    db_apply_drive();
     return ok;
 }
 
@@ -1151,7 +1181,7 @@ bool driver_board_boot_check(void)
     DB_LOCK();
     {
         spi_device_interface_config_t none = { .mode = 0, .duty_cycle_pos = 128,
-                                               .clock_speed_hz = 12 * 1000 * 1000, .queue_size = 1,
+                                               .clock_speed_hz = DB_SPI_HZ, .queue_size = 1,
                                                .spics_io_num = -1 };
         if (spi_bus_add_device(SPI_MASTER_ID, &none, &s_dev_none) != ESP_OK) s_dev_none = NULL;
     }
@@ -1207,7 +1237,7 @@ bool driver_board_boot_check(void)
             }
         }
     }
-    if (slow_test) bc_reattach(12 * 1000 * 1000);
+    if (slow_test) bc_reattach(DB_SPI_HZ);
     if (s_dev_none) { spi_bus_remove_device(s_dev_none); s_dev_none = NULL; }
     gpio_pulldown_dis(SPI_MASTER_MISO);
     gpio_pullup_en(SPI_MASTER_MISO);                                /* nobody talking = 0xFF, not noise */

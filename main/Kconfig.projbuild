@@ -91,6 +91,50 @@ config APP_SERVO_HOLD_CURRENT_MA
         hold and powers the servos fully off (limp), exactly like the old
         behaviour.
 
+config APP_SERVO_SPI_KHZ
+    int "Servo boards' SPI clock (kHz)"
+    range 500 15000
+    default 4000
+    help
+        The clock of the SPI bus to the four servo driver boards (mode 0;
+        15 MHz is the boards' maximum). Was 12000. CN3's chip select (GPIO15)
+        sits right next to the clock (GPIO16) on the ESP32-S3 module, and a
+        fast clock with a strong drive rings and couples into the chip
+        selects: the boards act on damaged frames (servos that flicker).
+        Softer edges (APP_SERVO_SPI_DRIVE) need a slower clock.
+          12000 kHz + drive 2: the original
+           4000 kHz + drive 1: the default
+           2000 kHz + drive 0: the softest
+        A frame to a board is a few dozen bytes, so even 2 MHz keeps the
+        servo tick well within time.
+
+choice APP_SERVO_SPI_DRIVE_CHOICE
+    prompt "Servo SPI output drive strength (GPIO drive cap)"
+    default APP_SERVO_SPI_DRIVE_1
+    help
+        gpio_set_drive_capability() on every line the ESP32 drives on the
+        servo bus (CLK, MOSI and the four chip selects). A weaker drive
+        softens the edges like a series resistor; pair it with a slower
+        clock (APP_SERVO_SPI_KHZ).
+
+config APP_SERVO_SPI_DRIVE_0
+    bool "0: ~5 mA (softest)"
+config APP_SERVO_SPI_DRIVE_1
+    bool "1: ~10 mA"
+config APP_SERVO_SPI_DRIVE_2
+    bool "2: ~20 mA (the ESP32's default)"
+config APP_SERVO_SPI_DRIVE_3
+    bool "3: ~40 mA (strongest)"
+
+endchoice
+
+config APP_SERVO_SPI_DRIVE
+    int
+    default 0 if APP_SERVO_SPI_DRIVE_0
+    default 1 if APP_SERVO_SPI_DRIVE_1
+    default 2 if APP_SERVO_SPI_DRIVE_2
+    default 3 if APP_SERVO_SPI_DRIVE_3
+
 config APP_STA_AUTO_CONNECT
     bool "Auto-connect to saved STA network on boot"
     default y

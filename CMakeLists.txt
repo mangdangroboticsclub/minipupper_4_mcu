@@ -56,8 +56,17 @@ set(MPX_PWA_INDEX "${MPX_PWA_DIR}/www/index.html")
 set(MPX_PWA_STAMP "${CMAKE_BINARY_DIR}/mpx_pwa.stamp")
 set(MPX_PWA_SCRIPT "${CMAKE_SOURCE_DIR}/tools/pwa_build.cmake")
 
-# npm is npm.cmd on Windows, next to node.exe.
-find_program(MPX_NPM_EXECUTABLE NAMES npm npm.cmd npm.exe)
+# npm is npm.cmd on Windows, next to node.exe. The extensionless "npm" beside it
+# is the shell script for Git Bash, which Windows cannot run, so it is never
+# taken there (and is dropped from a cache that found it before).
+if(CMAKE_HOST_WIN32)
+    if(MPX_NPM_EXECUTABLE AND NOT MPX_NPM_EXECUTABLE MATCHES "\\.([cC][mM][dD]|[eE][xX][eE])$")
+        unset(MPX_NPM_EXECUTABLE CACHE)
+    endif()
+    find_program(MPX_NPM_EXECUTABLE NAMES npm.cmd npm.exe)
+else()
+    find_program(MPX_NPM_EXECUTABLE NAMES npm)
+endif()
 
 if(MPX_BUILD_PWA AND NOT MPX_NPM_EXECUTABLE)
     if(EXISTS "${MPX_PWA_INDEX}")
