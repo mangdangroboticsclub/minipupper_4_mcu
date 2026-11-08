@@ -108,6 +108,9 @@ set(design_assets
     "../pwa-claw/www/eye-close.svg"
     "../pwa-claw/www/eye-close.svg.gz"
     "../pwa-claw/www/m-pupper3d.js.gz"
+    "../pwa-claw/www/m-preview3d.js.gz"
+    # shared three.js chunk (pupper3d + preview3d)
+    "../pwa-claw/www/m-three.module.js.gz"
     "../pwa-claw/www/pupper_model.json.gz"
 )
 
