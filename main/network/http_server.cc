@@ -101,17 +101,26 @@ static std::string url_decode(const std::string &src)
 /* ── Build a full filesystem path from a URI ────────────────── */
 std::string uri_to_path(const char *uri)
 {
+    // `req->uri` keeps the query string (`/m-preview3d.js?retry=123`), but a
+    // filesystem path must not: the query is how the PWA escapes a stale
+    // HTTP-cache entry for one of the fixed-name lazy chunks. Before this
+    // strip, any query built `/www/m-preview3d.js?retry=123`, fopen() failed,
+    // and the SPA fallback answered with index.html — so a cache-busting
+    // import got `text/html` for a module request and failed with a MIME
+    // error. See pwa-claw/src/lib/lazyChunk.js.
+    const std::string target(uri, std::strcspn(uri, "?"));
+
     // Default to index.html for root
-    if (std::strcmp(uri, "/") == 0) {
+    if (target == "/") {
         return std::string(WWW_ROOT) + "/index.html";
     }
 
     // Map favicon.ico to the app's SVG icon
-    if (std::strcmp(uri, "/favicon.ico") == 0) {
+    if (target == "/favicon.ico") {
         return std::string(WWW_ROOT) + "/md.svg";
     }
 
-    std::string path = std::string(WWW_ROOT) + uri;
+    std::string path = std::string(WWW_ROOT) + target;
 
     // Strip trailing slash
     if (path.size() > 0 && path.back() == '/') {
@@ -165,9 +174,9 @@ esp_err_t send_file(httpd_req_t *req, const char *fs_path,
         }
     }
 
-    // Set Cache-Control for static assets
-    if (httpd_resp_set_hdr(req, "Cache-Control",
-                           "public, max-age=31536000, immutable") != ESP_OK) {
+    // PWA asset names are stable across firmware builds. Revalidate them so a
+    // newly embedded lazy chunk replaces an older cached HTML fallback.
+    if (httpd_resp_set_hdr(req, "Cache-Control", "no-cache") != ESP_OK) {
         std::fclose(f);
         return ESP_FAIL;
     }
@@ -220,6 +229,12 @@ esp_err_t static_handler(httpd_req_t *req)
     const std::string fs_path = uri_to_path(req->uri);
     const std::string mime = get_mime_type(fs_path.c_str());
     const bool gzip = accepts_gzip(req);
+
+    // One line per static fetch. A skill preview that fails in the browser is
+    // diagnosed here: a first `import()` plus a cache-busting retry shows up as
+    // two lines for the same chunk, and an SPA fallback for a .js request shows
+    // up as the chunk followed by an index.html fetch.
+    ESP_LOGI(TAG, "static %s (gzip=%d)", req->uri, gzip ? 1 : 0);
 
     // Try gzipped first, then uncompressed. The claw design ships its large
     // files as .gz only (see main/CMakeLists.txt), so as a last resort the
@@ -2919,9 +2934,9 @@ bool start_http_server()
     }
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    // 52 register_api() + up to 12 register_static() + 2 websockets + 4
+    // 52 register_api() + up to 14 register_static() + 2 websockets + 4
     // marketplace wildcard methods + 5 display routes (http_display.cc) + 6
-    // voice routes (http_voice.cc) + 1 preview wildcard = 82.
+    // voice routes (http_voice.cc) + 1 preview wildcard = 84.
     // See the note on register_uri() - this number is load-bearing, and being
     // one short deletes a route without saying so. Each slot is a pointer, so
     // the headroom is cheap.
@@ -2985,6 +3000,8 @@ bool start_http_server()
     register_static("/eye-open.svg");
     register_static("/eye-close.svg");
     register_static("/m-pupper3d.js");         // lazily loaded three.js viewer
+    register_static("/m-preview3d.js");         // lazily loaded skill-preview viewer
+    register_static("/m-three.module.js");      // shared three.js chunk (both viewers)
     register_static("/pupper_model.json");     // three.js calibration model
 
     // ── Register WebSocket endpoint (telemetry) ──

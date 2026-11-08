@@ -48,7 +48,7 @@ const CACHE = `mpx-dog-${CACHE_VERSION}`;
  * The application itself. Anything here is checked against the network on
  * every load, so a firmware update takes effect on the next page load.
  */
-const APP_SHELL = new Set(["/", "/index.html", "/m.js", "/m-pupper3d.js", "/index.css"]);
+const APP_SHELL = new Set(["/", "/index.html", "/m.js", "/m-pupper3d.js", "/m-preview3d.js", "/m-three.module.js", "/index.css"]);
 
 /** Warmed on install so the very first offline load works. */
 const PRECACHE_URLS = [
@@ -101,10 +101,12 @@ self.addEventListener("activate", (event) => {
  */
 async function networkThenCache(request) {
   try {
-    const response = await fetch(request);
+    // Bypass stale HTTP-cache entries too. Stable asset URLs used to be served
+    // as immutable, including the HTML fallback for a missing lazy chunk.
+    const response = await fetch(request, { cache: "no-cache" });
     if (response && response.ok) {
       const cache = await caches.open(CACHE);
-      cache.put(request, response.clone());
+      await cache.put(request, response.clone());
     }
     return response;
   } catch {

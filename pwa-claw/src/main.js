@@ -2,6 +2,12 @@ import { mount } from "svelte";
 import App from "./app.svelte";
 import "./app.css";
 
+/* Which bundle is running. Asset URLs are stable across firmware builds, so a
+   browser can keep executing cached shell code indefinitely; this line makes
+   that visible in the very first console entry (window.__MPX_BUILD__ too). */
+console.info("[mpx] build", __MPX_BUILD__);
+window.__MPX_BUILD__ = __MPX_BUILD__;
+
 const app = mount(App, {
   target: document.getElementById("app"),
 });

@@ -818,10 +818,22 @@ esp_err_t serve_cached(httpd_req_t *req, const PreviewPath &path,
     while (remaining > 0) {
         const size_t wanted = std::min(remaining, RECV_CHUNK);
         const size_t got = fread(buffer, 1, wanted, f);
-        if (got == 0 || httpd_send(req, buffer, got) != ESP_OK) {
+        if (got == 0) {
             result = ESP_FAIL;
             break;
         }
+        // httpd_send returns the byte count, not ESP_OK. Treating a successful
+        // 16 KiB write as an error truncated every cached multi-chunk artifact.
+        size_t sent_total = 0;
+        while (sent_total < got) {
+            const ssize_t sent = httpd_send(req, buffer + sent_total, got - sent_total);
+            if (sent <= 0) {
+                result = ESP_FAIL;
+                break;
+            }
+            sent_total += static_cast<size_t>(sent);
+        }
+        if (result != ESP_OK) break;
         remaining -= got;
         vTaskDelay(1);
     }

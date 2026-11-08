@@ -1,4 +1,6 @@
 <script>
+  import { revalidatedImport, threeModuleUrl } from "./lazyChunk.js";
+
   let { onBack } = $props();
 
   // Servo index base for each leg. THESE MUST MATCH THE FIRMWARE: robot.h lays
@@ -46,6 +48,12 @@
     if (!canvasEl) return;
     let cancelled = false;
     import("./pupper3d.js")
+      .catch((error) => {
+        if (!import.meta.env.PROD) throw error;
+        // Same cached-HTML-fallback trap as the skill preview chunk; see
+        // lazyChunk.js.
+        return revalidatedImport("/m-pupper3d.js", [threeModuleUrl]);
+      })
       .then(({ createPupperView }) => createPupperView(canvasEl, "/pupper_model.json", {
         onPickLeg: (leg) => selectLeg(leg),
       }))
