@@ -121,7 +121,9 @@ def action_extensions(base_actions, project_path):
         if _pwa_disabled(global_args, build_dir):
             return
 
-        npm = shutil.which('npm')
+        # On Windows npm is npm.cmd; the extensionless 'npm' beside it is the
+        # Git Bash script, which Windows cannot run.
+        npm = (shutil.which('npm.cmd') or shutil.which('npm.exe')) if os.name == 'nt' else shutil.which('npm')
         if not npm:
             print('pwa-claw: npm not found in PATH, embedding www/ as it is.')
             return

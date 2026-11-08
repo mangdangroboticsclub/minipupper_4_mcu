@@ -1,6 +1,10 @@
 # Project sdkconfig defaults.
 # Seeded so a fresh `idf.py reconfigure` / `fullclean` keeps these values.
 
+# The chip. A fresh clone has no sdkconfig, and without this ESP-IDF would
+# default to esp32 (idf.py set-target esp32s3 would be needed first).
+CONFIG_IDF_TARGET="esp32s3"
+
 # Settings that lived only in the committed sdkconfig until Phase 5, when
 # sdkconfig had to be regenerated (ESP-Claw's Kconfig, the partition table,
 # XIP) and they would otherwise have silently fallen back to their Kconfig
