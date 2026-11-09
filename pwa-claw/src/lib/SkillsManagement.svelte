@@ -6,6 +6,14 @@
     deploySkill,
     enqueueLua,
   } from "./marketplaceApi.js";
+  import {
+    prettySkillName,
+    runSkill,
+    skillActionId,
+    skillPathsFromScripts,
+    skillRunNameFromPaths,
+    waitForSkillFiles,
+  } from "./skillActions.js";
 
   /**
    * Skills: what is on the robot, and what you own but haven't put on it.
@@ -16,8 +24,12 @@
    * even when the store can't be reached.
    *
    * @prop onNavigate — ("store") => void
+   * @prop pinned — Quick action ids
+   * @prop onTogglePin — (quickActionId) => void
+   * @prop onRegistryChange — (registryEntries) => void
+   * @prop onDeployedChange — (browser-known deployed paths by skill id) => void
    */
-  let { onNavigate } = $props();
+  let { onNavigate, pinned = [], onTogglePin, onRegistryChange, onDeployedChange } = $props();
 
   let tab = $state("robot");            // "robot" | "library"
   let owned = $state([]);               // /v1/marketplace/robot/skills
@@ -42,6 +54,7 @@
   let deployed = $state({});
   try { const raw = localStorage.getItem(DEPLOYED_KEY); if (raw) deployed = JSON.parse(raw); } catch {}
   function saveDeployed() { try { localStorage.setItem(DEPLOYED_KEY, JSON.stringify(deployed)); } catch {} }
+  $effect(() => { onDeployedChange?.(deployed); });
 
   async function refresh({ quiet = false } = {}) {
     if (!quiet) loading = true;
@@ -57,6 +70,7 @@
       catalog = Object.fromEntries(catRes.value.map((s) => [s.id, s]));
     }
     registry = regRes.status === "fulfilled" && regRes.value?.skills ? regRes.value.skills : [];
+    onRegistryChange?.(registry);
     running = statRes.status === "fulfilled" && statRes.value?.running ? statRes.value.name || "" : null;
     loading = false;
   }
@@ -64,7 +78,7 @@
 
   const isMotion = (s) => (s.skill_type || "").toLowerCase() === "wasm";
   const tail = (id) => (id || "").split("~").pop();
-  const pretty = (slug) => (slug || "").replace(/\.(wasm|mpxe)$/, "").replace(/[_-]+/g, " ").replace(/^\w/, (c) => c.toUpperCase());
+  const pretty = prettySkillName;
 
   function registryFor(skillId) {
     const t = tail(skillId);
@@ -81,7 +95,7 @@
         desc: catalog[s.skill_id]?.description || "",
         motion,
         onRobot: motion ? s.skill_id in deployed || !!reg : !!s.enabled,
-        runName: reg ? reg.slug || reg.file.replace(/^\//, "") : null,
+        runName: reg ? reg.slug || reg.file.replace(/^\//, "") : skillRunNameFromPaths(deployed[s.skill_id]),
         src: s,
       };
     });
@@ -115,13 +129,15 @@
       const data = await deploySkill(item.key);
       const scripts = [];
       for (const s of data.skills || []) for (const cmd of s.commands || []) { scripts.push(cmd.script); await enqueueLua(cmd.script); }
-      const paths = [];
-      for (const sc of scripts) for (const m of sc.matchAll(/file_write\s*\(\s*["']([^"']+)["']/g)) paths.push(m[1]);
+      const paths = skillPathsFromScripts(scripts);
       deployed = { ...deployed, [item.key]: paths };
       saveDeployed();
+      await waitForSkillFiles(paths);
       await refresh({ quiet: true });
       say(`${item.name} is on the robot`);
-    } catch { say("Install failed", "err"); }
+    } catch {
+      say("Install failed", "err");
+    }
     busy = null;
   }
 
@@ -142,14 +158,18 @@
     busy = item.key;
     try {
       if (running && running === item.runName) {
-        await fetch("/v1/skills/stop", { method: "POST" });
+        const response = await fetch("/v1/skills/stop", { method: "POST" });
+        if (!response.ok) throw new Error(`Couldn't stop skill (${response.status})`);
         running = null;
+        say(`Stopping ${item.name}`);
       } else {
-        const r = await fetch("/v1/skills/run", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ skill: item.runName }) });
-        if (r.status === 409) say("Another skill is running. Stop it first.", "err");
-        else running = item.runName;
+        await runSkill(item.runName);
+        running = item.runName;
+        say(`Running ${item.name}`);
       }
-    } catch { say("Couldn't reach the robot", "err"); }
+    } catch (error) {
+      say(error.message || "Couldn't reach the robot", "err");
+    }
     busy = null;
   }
 </script>
@@ -210,7 +230,24 @@
                 {#if tab === "robot"}
                   {#if item.motion}
                     {#if item.runName}
-                      <button type="button" class="btn" class:dark={isRunning} disabled={busy === item.key} onclick={() => run(item)} aria-label="{isRunning ? 'Stop' : 'Run'} {item.name}">{isRunning ? "Stop" : "Run"}</button>
+                      <button type="button" class="btn skill-run" class:running={isRunning} disabled={busy === item.key} onclick={() => run(item)} aria-label="{isRunning ? 'Stop' : 'Run'} {item.name}">
+                        <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                          {#if isRunning}<rect x="6" y="6" width="12" height="12" rx="2" />{:else}<path d="m8 5 11 7-11 7V5Z" />{/if}
+                        </svg>
+                        <span>{isRunning ? "Stop" : "Run"}</span>
+                      </button>
+                    {/if}
+                    {#if item.runName}
+                      {@const quickId = skillActionId(item.runName)}
+                      {@const isPinned = pinned.includes(quickId)}
+                      <button
+                        type="button"
+                        class="pin"
+                        class:on={isPinned}
+                        aria-pressed={isPinned}
+                        aria-label="{isPinned ? 'Remove' : 'Add'} {item.name} {isPinned ? 'from' : 'to'} Quick actions"
+                        onclick={() => onTogglePin?.(quickId)}
+                      >{isPinned ? "Pinned" : "Pin"}</button>
                     {/if}
                     {#if item.src && item.key in deployed}
                       <button type="button" class="link" disabled={busy === item.key} onclick={() => remove(item)} aria-label="Remove {item.name} from the robot">Remove</button>
@@ -262,7 +299,14 @@
   .acts { display: flex; flex-direction: column; align-items: flex-end; gap: 2px; flex-shrink: 0; }
   .btn { height: 40px; min-width: 84px; padding: 0 14px; border-radius: 20px; border: none; background: var(--ground); color: var(--ink); font-size: 14px; font-weight: 800; cursor: pointer; }
   .btn.dark { background: var(--ink); color: var(--mpx-yellow); }
+  .skill-run { display: inline-flex; align-items: center; justify-content: center; gap: 7px; min-width: 96px; background: var(--mpx-yellow); color: var(--ink); box-shadow: 0 2px 5px #1f252d1a; transition: transform 120ms ease, box-shadow 120ms ease; }
+  .skill-run:hover:not(:disabled) { transform: translateY(-1px); box-shadow: 0 4px 8px #1f252d26; }
+  .skill-run:active:not(:disabled) { transform: translateY(0); box-shadow: 0 1px 3px #1f252d1a; }
+  .skill-run.running { background: var(--ink); color: var(--mpx-yellow); }
+  .skill-run svg { flex-shrink: 0; }
   .btn:disabled, .link:disabled { opacity: 0.6; cursor: default; }
+  .pin { height: 32px; min-width: 84px; border: none; border-radius: 16px; background: transparent; color: var(--sub); font-size: 13px; font-weight: 700; cursor: pointer; }
+  .pin.on { background: var(--mpx-yellow); color: var(--ink); }
   .link { height: 32px; border: none; background: transparent; color: #9B2C20; font-size: 13px; font-weight: 700; cursor: pointer; padding: 0 6px; }
   button:focus-visible { outline: 3px solid var(--ink); outline-offset: 2px; }
 

@@ -6,6 +6,7 @@
    *
    * @prop actions      built-in moves [{ id, label, emoji }]
    * @prop custom       moves the user added [{ id, label, emoji }]
+   * @prop skills       installed motion skills [{ id, label, runName }]
    * @prop pinned       pinned ids
    * @prop onRun        (id) => void
    * @prop onTogglePin  (id) => void
@@ -13,12 +14,13 @@
    * @prop onAdd        () => void
    * @prop onBack       () => void
    */
-  let { actions = [], custom = [], pinned = [], onRun, onTogglePin, onDelete, onAdd, onBack } = $props();
+  let { actions = [], custom = [], skills = [], pinned = [], onRun, onTogglePin, onDelete, onAdd, onBack } = $props();
 
   let query = $state("");
   const match = (a) => !query.trim() || a.label.toLowerCase().includes(query.trim().toLowerCase());
   const shownBuiltIn = $derived(actions.filter(match));
   const shownCustom = $derived(custom.filter(match));
+  const shownSkills = $derived(skills.filter(match));
 </script>
 
 {#snippet tile(a, isCustom)}
@@ -58,6 +60,11 @@
         <input type="search" bind:value={query} placeholder="Search moves" />
       </label>
       <p class="hint">Tap a move to run it. The pin puts it in Quick actions on Home.</p>
+
+      {#if shownSkills.length}
+        <h2>Installed skills</h2>
+        <ul class="grid">{#each shownSkills as a (a.id)}{@render tile(a, false)}{/each}</ul>
+      {/if}
 
       {#if shownCustom.length}
         <h2>Your moves</h2>

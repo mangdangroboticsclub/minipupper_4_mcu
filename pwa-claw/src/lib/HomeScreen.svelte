@@ -11,6 +11,7 @@
   import SettingsPage from "./SettingsPage.svelte";
   import WifiSheet from "./WifiSheet.svelte";
   import SystemMonitor from "./SystemMonitor.svelte";
+  import { runSkill, skillActionsFromInstalled } from "./skillActions.js";
 
   let { network } = $props();
 
@@ -122,7 +123,28 @@
     try { localStorage.setItem(KEY_PINNED, p); } catch {}
   });
 
-  const allActions = $derived([...actions, ...customActions.map((c) => ({ ...c, category: c.category || "custom" }))]);
+  let registrySkills = $state([]);
+  let deployedSkills = $state({});
+  const skillActions = $derived(skillActionsFromInstalled(registrySkills, deployedSkills));
+
+  try {
+    const saved = localStorage.getItem("mpx_deployed_skills");
+    if (saved) deployedSkills = JSON.parse(saved);
+  } catch {}
+
+  async function refreshSkillActions() {
+    try {
+      const response = await fetch("/v1/skills/registry", { cache: "no-store" });
+      if (response.ok) registrySkills = (await response.json()).skills || [];
+    } catch { /* Skills return when the robot is reachable again. */ }
+  }
+  $effect(() => { refreshSkillActions(); });
+
+  const allActions = $derived([
+    ...actions,
+    ...skillActions,
+    ...customActions.map((c) => ({ ...c, category: c.category || "custom" })),
+  ]);
   const pinnedObjects = $derived(pinnedActions.map((id) => allActions.find((a) => a.id === id)).filter(Boolean));
 
   function togglePin(id) {
@@ -130,6 +152,31 @@
   }
 
   let flash = $state(null);
+  let actionError = $state(null);
+  let actionErrorTimer = null;
+
+  function showActionError(message) {
+    actionError = message;
+    clearTimeout(actionErrorTimer);
+    actionErrorTimer = setTimeout(() => (actionError = null), 3000);
+  }
+
+  async function runAction(action) {
+    if (!action) return;
+    if (action.category !== "skill") return sendGait(action.id);
+    flash = action.id;
+    setTimeout(() => { if (flash === action.id) flash = null; }, 700);
+    try {
+      await runSkill(action.runName);
+    } catch (error) {
+      showActionError(error.message || "Couldn't start skill");
+    }
+  }
+
+  function runActionById(id) {
+    runAction(allActions.find((action) => action.id === id));
+  }
+
   async function sendGait(mode) {
     flash = mode;
     setTimeout(() => { if (flash === mode) flash = null; }, 700);
@@ -246,7 +293,8 @@
           actions={actions.filter((a) => a.id !== "none")}
           custom={customActions}
           pinned={pinnedActions}
-          onRun={sendGait}
+          skills={skillActions}
+          onRun={runActionById}
           onTogglePin={togglePin}
           onDelete={(id) => { customActions = customActions.filter((c) => c.id !== id); pinnedActions = pinnedActions.filter((x) => x !== id); }}
           onAdd={() => { showAllActions = false; showAddAction = true; }}
@@ -304,7 +352,7 @@
               <ul class="quick-grid">
                 {#each pinnedObjects as a (a.id)}
                   <li>
-                    <button type="button" class="qa" class:hit={flash === a.id} onclick={() => sendGait(a.id)} aria-label="Run {a.label}">
+                    <button type="button" class="qa" class:hit={flash === a.id} onclick={() => runAction(a)} aria-label="Run {a.label}">
                       <span class="qa-ico"><ActionIcon id={a.id} emoji={a.emoji} /></span>
                       <span class="qa-lbl">{a.label}</span>
                     </button>
@@ -322,7 +370,14 @@
         </div>
       {/if}
     {:else if activeTab === "skills"}
-      <SkillsManagement embedded onNavigate={(to) => { if (to === "store") activeTab = "store"; }} />
+      <SkillsManagement
+        embedded
+        pinned={pinnedActions}
+        onTogglePin={togglePin}
+        onRegistryChange={(entries) => (registrySkills = entries)}
+        onDeployedChange={(deployed) => (deployedSkills = deployed)}
+        onNavigate={(to) => { if (to === "store") activeTab = "store"; }}
+      />
     {:else if activeTab === "store"}
       <SkillsMarketplace embedded onNavigate={(to) => { if (to === "skills") activeTab = "skills"; }} />
     {:else if activeTab === "chat"}
@@ -358,6 +413,10 @@
         />
       </div>
     </div>
+  {/if}
+
+  {#if actionError}
+    <div class="action-error" role="status">{actionError}</div>
   {/if}
 
   {#if showWifi}
@@ -452,6 +511,13 @@
   .home.desk .quick { flex: 0 0 auto; max-width: 1032px; margin-top: 18px; }
   .home.desk .quick-grid { grid-template-columns: repeat(auto-fill, minmax(112px, 1fr)); }
   .home.desk .qa { height: 72px; }
+
+  .action-error {
+    position: absolute; z-index: 60; left: 50%; bottom: calc(76px + var(--safe-bottom));
+    transform: translateX(-50%); max-width: calc(100% - 40px); padding: 10px 16px;
+    border-radius: 14px; background: #9B2C20; color: #fff; font-size: 14px; font-weight: 600;
+    box-shadow: var(--shadow-float); text-align: center;
+  }
 
   /* ── Chat ── */
   .chat-tab { position: absolute; inset: 0; display: flex; flex-direction: column; }
