@@ -8,13 +8,29 @@
   import UploadView from "./UploadView.svelte";
   import DisplayPage from "./DisplayPage.svelte";
 
-  let { network } = $props();
+  let {
+    network,
+    controlScheme = "",
+    controlSchemeReady = false,
+    onControlScheme = async () => {},
+  } = $props();
 
   /** null | "wifi" | "hotspot" | "ai" | "calibration" | "studio" | "display" | "files" | "upload" */
   let page = $state(null);
 
   const staConnected = $derived(network?.staState === "connected");
   const piIp = $derived(network?.piIp || "");
+
+  let schemeBusy = $state(false);
+  let schemeError = $state("");
+  async function selectControlScheme(scheme) {
+    if (schemeBusy || !controlSchemeReady || scheme === controlScheme) return;
+    schemeBusy = true;
+    schemeError = "";
+    try { await onControlScheme(scheme); }
+    catch { schemeError = "Couldn't save on the robot"; }
+    finally { schemeBusy = false; }
+  }
   // mpx-dog: the Pi link, on-device AI and the LCD are later porting phases.
   // Each section shows only once its firmware endpoint answers, so this one
   // app build runs against both the phase-1 firmware and the full one.
@@ -198,6 +214,7 @@
 {#snippet iHotspot()}<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="2"/><path d="M8 8a6 6 0 0 0 0 8M16 8a6 6 0 0 1 0 8M5 5a10 10 0 0 0 0 14M19 5a10 10 0 0 1 0 14"/></svg>{/snippet}
 {#snippet iPi()}<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M7 9h4v4H7zM14 9h3M14 13h3"/></svg>{/snippet}
 {#snippet iPower()}<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M12 3v9"/><path d="M6.3 7.2a8 8 0 1 0 11.4 0"/></svg>{/snippet}
+{#snippet iController()}<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 6h8a6 6 0 0 1 5.7 7.9l-1.1 3.4a2.5 2.5 0 0 1-4.1 1L14.5 16h-5l-2 2.3a2.5 2.5 0 0 1-4.1-1l-1.1-3.4A6 6 0 0 1 8 6z"/><path d="M7 10v4M5 12h4M16.5 11.5h.01M18.5 13.5h.01"/></svg>{/snippet}
 {#snippet iAi()}<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>{/snippet}
 {#snippet iCal()}<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 20l4-9 5 3 5-9"/><circle cx="9" cy="11" r="1.6" fill="currentColor"/><circle cx="14" cy="14" r="1.6" fill="currentColor"/></svg>{/snippet}
 {#snippet iStudio()}<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M6 4v16M12 4v16M18 4v16"/><path d="M4 9h4M10 14h4M16 7h4" stroke-width="2.6"/></svg>{/snippet}
@@ -323,6 +340,25 @@
       <section>
         <h2>Robot</h2>
         <div class="group">
+          <div class="row static scheme-row">
+            <span class="ico">{@render iController()}</span>
+            <span class="txt">
+              <span class="t">Control scheme</span>
+              <span class="d">{schemeError || (schemeBusy ? "Saving on robot…" : controlSchemeReady ? "Saved on robot" : "Unavailable — reconnect to robot")}</span>
+            </span>
+            <div class="seg scheme" role="radiogroup" aria-label="Control scheme">
+              {#each ["PS4", "Haris"] as scheme}
+                <button
+                  type="button"
+                  role="radio"
+                  aria-checked={controlScheme === scheme}
+                  class:on={controlScheme === scheme}
+                  disabled={schemeBusy || !controlSchemeReady}
+                  onclick={() => selectControlScheme(scheme)}
+                >{scheme}</button>
+              {/each}
+            </div>
+          </div>
           {#if hasDisplay}
             {@render row({ icon: iDisplay, title: "Display", desc: displayLabel, onclick: () => (page = "display") })}
           {/if}
@@ -406,6 +442,8 @@
     font-size: 13px; font-weight: 700; cursor: pointer;
   }
   .seg button.on { background: #fff; color: var(--ink); box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12); }
+  .seg.scheme { grid-template-columns: repeat(2, minmax(0, 1fr)); width: 144px; flex-shrink: 0; }
+  .seg.scheme button { height: 34px; }
   .seg button:focus-visible { outline: 3px solid var(--ink); outline-offset: 1px; }
   .rest-actions { display: flex; }
   .act { height: 44px; border-radius: 22px; border: none; background: var(--ink); color: #fff; padding: 0 18px; font-size: 14px; font-weight: 700; cursor: pointer; }

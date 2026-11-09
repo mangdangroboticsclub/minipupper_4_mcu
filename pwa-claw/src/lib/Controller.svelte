@@ -49,15 +49,29 @@
   // ── Robot API: joystick stream ───────────────────────────────
   let joyF = 0, joyS = 0, joyT = 0;
   let joyTimer = null;
+  let joyInFlight = Promise.resolve(), joySending = false, joyAgain = false;
 
-  async function sendJoy() {
-    try {
-      await fetch("/v1/robot/joy", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ f: joyF, s: joyS, t: joyT }),
-      });
-    } catch { /* transient — keep trying while the stick is held */ }
+  function sendJoy() {
+    // Attitude owns the robot until its final neutral request has completed.
+    if (bodyRollHeld() || rollPending > 0) return joyInFlight;
+    if (joySending) { joyAgain = true; return joyInFlight; }
+    joySending = true;
+    joyInFlight = (async () => {
+      try {
+        do {
+          joyAgain = false;
+          try {
+            await fetch("/v1/robot/joy", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ f: joyF, s: joyS, t: joyT }),
+            });
+          } catch { /* transient — keep trying while the stick is held */ }
+          // One trailing packet carries the latest axes, including final zero.
+        } while (joyAgain && !bodyRollHeld() && rollPending === 0);
+      } finally { joySending = false; }
+    })();
+    return joyInFlight;
   }
   function joyStartTimer() {
     if (!joyTimer) {
@@ -69,18 +83,24 @@
     if (joyF === 0 && joyS === 0 && joyT === 0 && joyTimer) {
       clearInterval(joyTimer);
       joyTimer = null;
-      sendJoy(); // final zeros → step in place
+      return sendJoy(); // final zeros → step in place
     }
+    return joyInFlight;
   }
 
+  // Gait and attitude commands share one FIFO: a delayed request must not
+  // land after a newer pose (or after neutral from a control's release).
+  let motionCommands = Promise.resolve();
+  function queueMotionCommand(url, options) {
+    motionCommands = motionCommands.then(() => fetch(url, options)).catch(() => null);
+    return motionCommands;
+  }
   async function sendGait(mode) {
-    try {
-      await fetch("/v1/robot/gait", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ mode }),
-      });
-    } catch { /* ignore */ }
+    await queueMotionCommand("/v1/robot/gait", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode }),
+    });
   }
 
   // ── Look direction (head pose) ───────────────────────────────
@@ -111,23 +131,34 @@
   const LOOK_YAW_MAX = 30, LOOK_PITCH_MAX = 20;
   let lookPadOk = true;
   let lookPending = null, lookTimer = null, lookLastSent = "";
+  let lookSending = false, lookStopSeq = 0, lookStopToken = 0;
   function lookPadSend() {
     lookTimer = null;
     if (!lookPending) return;
+    // At most one Look request in flight; keep only the latest pending pose.
+    if (lookSending) { lookTimer = setTimeout(lookPadSend, 80); return; }
     const { yaw, pitch } = lookPending;
     lookPending = null;
     const key = `${yaw},${pitch}`;
     if (key === lookLastSent) return;
     lookLastSent = key;
-    fetch(`/v1/robot/look?yaw=${yaw}&pitch=${pitch}`)
+    // Look has its own 80 ms coalescing channel. Do not put these samples in
+    // motionCommands: slow responses would otherwise backlog stale poses and
+    // delay a later gait stop or roll-neutral command.
+    lookSending = true;
+    fetch(`/v1/robot/look?yaw=${yaw}&pitch=${pitch}`, { cache: "no-store" })
       .then((r) => { if (r.status === 404) lookPadOk = false; })
-      .catch(() => {});
+      .catch(() => {})
+      .finally(() => {
+        lookSending = false;
+        if (lookPending && !lookTimer) lookTimer = setTimeout(lookPadSend, 0);
+      });
     lookTimer = setTimeout(lookPadSend, 80);
   }
   function sendLook(nx, ny) {
     if (!lookPadOk) { sendLookMode(joystickToLookMode(nx, ny)); return; }
     const m = Math.hypot(nx, ny);
-    const k = m > 0 ? Math.min(1, (m - LOOK_DEADZONE) / (1 - LOOK_DEADZONE)) / m : 0;
+    const k = m > 0 ? Math.max(0, Math.min(1, (m - LOOK_DEADZONE) / (1 - LOOK_DEADZONE))) / m : 0;
     lookPending = {
       yaw: Math.round(nx * k * LOOK_YAW_MAX),          // stick right -> head right
       pitch: Math.round(-ny * k * LOOK_PITCH_MAX),     // stick up -> nose up
@@ -137,19 +168,38 @@
 
   // ── Sticks ───────────────────────────────────────────────────
   // Each stick tracks its own pointer so Move + Look work together on touch.
-  const makeStick = () => ({ nx: 0, ny: 0, dx: 0, dy: 0, active: false, pointerId: null, cx: 0, cy: 0, r: 0 });
+  const makeStick = () => ({ nx: 0, ny: 0, dx: 0, dy: 0, px: 0, py: 0, active: false, pointerId: null, cx: 0, cy: 0, r: 0 });
   let move = $state(makeStick());
   let look = $state(makeStick());
   const stickOf = (which) => (which === "move" ? move : look);
 
-  // The right stick moves the head (look); turning is on the shoulder buttons.
-  // While a shoulder Turn button is held, zeroing the move stick must not send
-  // `none` (that would cancel the turn).
+  // The right stick looks around on its own, but becomes the turn stick while
+  // Move is held so one thumb can steer the walk. Shoulder turns still work.
   const turning = () => pressed.has("turn-l") || pressed.has("turn-r");
+  const shoulderYaw = () => turning() ? (pressed.has("turn-l") ? 1 : -1) : 0;
+  const rightTurnRate = (nx) => {
+    const a = Math.abs(nx);
+    if (a < DEADZONE) return 0;
+    // Firmware: t > 0 turns left. Start above its 0.08 motion threshold.
+    const t = Math.sign(nx) * Math.min(1, 0.1 + 0.9 * (a - DEADZONE) / (1 - DEADZONE));
+    return -(+t.toFixed(3));
+  };
+
+  function useTurnPose(s) {
+    const nx = s.r > 0 ? +(s.px / s.r).toFixed(4) : 0;
+    s.dx = s.px; s.dy = 0;
+    s.nx = Math.abs(nx) < DEADZONE ? 0 : nx; s.ny = 0;
+  }
+  function useLookPose(s) {
+    let nx = s.r > 0 ? +(s.px / s.r).toFixed(4) : 0;
+    let ny = s.r > 0 ? +(s.py / s.r).toFixed(4) : 0;
+    if (Math.hypot(nx, ny) < LOOK_DEADZONE) { nx = 0; ny = 0; }
+    s.dx = s.px; s.dy = s.py; s.nx = nx; s.ny = ny;
+  }
 
   function stickDown(e, which) {
     const s = stickOf(which);
-    if (!powered || s.active) return;
+    if (!powered || s.active || bodyRollHeld() || rollPending > 0) return;
     e.preventDefault();
     const rect = e.currentTarget.getBoundingClientRect();
     s.cx = rect.left + rect.width / 2;
@@ -158,6 +208,15 @@
     s.active = true;
     s.pointerId = e.pointerId;
     capture(e.currentTarget, e.pointerId);
+    // Even a Move-only press must cancel an older deferred Look restoration.
+    if (which === "move") lookStopToken = 0;
+    if (which === "move" && look.active) {
+      // The right finger may already be down: switch its existing deflection
+      // to steering now, without waiting for another pointermove event.
+      useTurnPose(look);
+      sendLook(0, 0);
+      if (!turning()) joyT = rightTurnRate(look.nx);
+    }
     stickUpdate(e, which);
   }
   function stickMove(e, which) {
@@ -171,12 +230,24 @@
     if (!s.active || e.pointerId !== s.pointerId) return;
     s.active = false;
     s.pointerId = null;
-    s.nx = s.ny = s.dx = s.dy = 0;
+    s.nx = s.ny = s.dx = s.dy = s.px = s.py = 0;
     if (which === "move") {
       joyF = 0; joyS = 0;
-      if (!turning()) sendGait("none"); // zero joy alone doesn't halt walking
+      if (look.active) {
+        // Recompute Look from the raw finger position: the right pointer may
+        // not generate another event during this mode transition.
+        joyT = shoulderYaw();
+        useLookPose(look);
+        if (!turning()) restoreLookAfterStop();
+      } else {
+        if (!turning()) sendGait("none"); // zero joy alone doesn't halt walking
+        joyStopIfIdle();
+      }
+    } else if (move.active) {
+      joyT = shoulderYaw();
       joyStopIfIdle();
     } else {
+      lookStopToken = 0; // cancel a delayed restoration after right release
       sendLook(0, 0);
     }
   }
@@ -187,11 +258,16 @@
     // Turned 90° clockwise, the pad's right is the screen's down.
     let dx = rotated ? sy : sx;
     let dy = rotated ? -sx : sy;
+    const turnStick = which === "look" && move.active;
     const dist = Math.hypot(dx, dy);
     if (dist > s.r) { dx = (dx / dist) * s.r; dy = (dy / dist) * s.r; }
+    // Preserve the full pad position so releasing Move can restore Look even
+    // if the right finger stays perfectly still during the transition.
+    s.px = dx; s.py = dy;
+    if (turnStick) dy = 0; // turning uses the left-right axis only
     let nx = s.r > 0 ? +(dx / s.r).toFixed(4) : 0;
     let ny = s.r > 0 ? +(dy / s.r).toFixed(4) : 0;
-    const dz = which === "move" ? DEADZONE : LOOK_DEADZONE;
+    const dz = which === "move" || turnStick ? DEADZONE : LOOK_DEADZONE;
     const mag = Math.hypot(nx, ny);
     // The knob follows the finger even inside the deadzone; only the command
     // is held at zero there.
@@ -202,8 +278,12 @@
     if (which === "move") {
       joyF = -ny;
       joyS = -nx;
-      if (mag < dz) joyStopIfIdle(); else joyStartTimer();
-    } else {
+      if (mag >= dz || joyT !== 0) joyStartTimer(); else joyStopIfIdle();
+    } else if (turnStick) {
+      sendLook(0, 0); // leave any previous look pose before steering
+      if (!turning()) joyT = rightTurnRate(nx); // a held shoulder has priority
+      if (joyT === 0) joyStopIfIdle(); else joyStartTimer();
+    } else if (lookStopToken === 0) {
       sendLook(nx, ny);
     }
   }
@@ -217,11 +297,9 @@
     "key-down": "back",
     "key-left": "left",
     "key-right": "right",
-    // d-pad: body height and side steps
+    // d-pad: body height; left/right roll are handled separately below
     "dpad-up": "heightup",
     "dpad-down": "heightdown",
-    "dpad-left": "left",
-    "dpad-right": "right",
     "action-top": "jump",
     "action-right": "twerk",
     "action-bottom": "situp",
@@ -253,19 +331,60 @@
     joyT = TURN_YAW[id];
     joyStartTimer();
   }
+  function restoreLookAfterStop() {
+    // Both the walking gait and final zero Joy packet precede analog Look;
+    // otherwise either can replace the pose after the left stick is released.
+    const token = ++lookStopSeq;
+    lookStopToken = token;
+    const gaitStopped = sendGait("none");
+    const joyStopped = joyStopIfIdle();
+    Promise.all([gaitStopped, joyStopped]).then(() => {
+      if (token !== lookStopToken) return;
+      lookStopToken = 0;
+      if (!move.active && look.active && !turning()) sendLook(look.nx, look.ny);
+    });
+  }
   function turnRelease() {
-    joyT = turning() ? (pressed.has("turn-l") ? 1 : -1) : 0;
+    joyT = shoulderYaw();
+    if (joyT === 0 && move.active && look.active) joyT = rightTurnRate(look.nx);
     if (joyT === 0 && joyF === 0 && joyS === 0) {
-      sendGait("none");   // nothing held any more: stop, like letting go of the Move stick
-      joyStopIfIdle();
+      if (look.active) restoreLookAfterStop();
+      else {
+        sendGait("none"); // nothing held any more: stop, like releasing Move
+        joyStopIfIdle();
+      }
     }
+  }
+
+  // Direct body attitude: roll + leans right, roll - leans left. It is
+  // exclusive with other controls so their gait/yaw streams cannot replace it.
+  const BODY_ROLL = { "dpad-left": -15, "dpad-right": 15 };
+  const bodyRollHeld = () => pressed.has("dpad-left") || pressed.has("dpad-right");
+  let rollPending = 0;
+  function sendBodyRoll(roll) {
+    rollPending++;
+    return (async () => {
+      await joyInFlight; // finish the last walking packet before taking over
+      await queueMotionCommand(`/v1/robot/attitude?roll=${roll}`, { cache: "no-store" });
+    })().finally(() => { rollPending--; });
   }
 
   function press(id) {
     if (!powered || pressed.has(id)) return;
+    if (id in BODY_ROLL) {
+      const anotherButton = [...pressed].some((held) => !(held in BODY_ROLL));
+      if (move.active || look.active || anotherButton) return;
+    } else if (bodyRollHeld() || rollPending > 0) {
+      return; // wait for Roll and its neutral request before another control
+    }
     pressed = new Set(pressed).add(id);
     if (id in TURN_YAW) {
       turnPress(id);
+      if (navigator.vibrate) { try { navigator.vibrate(8); } catch {} }
+      return;
+    }
+    if (id in BODY_ROLL) {
+      sendBodyRoll(BODY_ROLL[id]);
       if (navigator.vibrate) { try { navigator.vibrate(8); } catch {} }
       return;
     }
@@ -281,15 +400,23 @@
     if (!pressed.has(id)) return;
     const next = new Set(pressed); next.delete(id); pressed = next;
     if (id in TURN_YAW) { turnRelease(); return; }
+    if (id in BODY_ROLL) {
+      const other = id === "dpad-left" ? "dpad-right" : "dpad-left";
+      sendBodyRoll(pressed.has(other) ? BODY_ROLL[other] : 0);
+      return;
+    }
     const gait = gaitFor(id);
     if (gait && isContinuous(gait)) sendGait("none");
     if (SLOTS.some((s) => s.id === id)) setTimeout(() => { if (!SLOTS.some((s) => pressed.has(s.id))) lastLabel = ""; }, 900);
   }
   function stopAll() {
+    const bodyRolling = pressed.has("dpad-left") || pressed.has("dpad-right");
+    lookStopToken = 0;
     pressed = new Set();
     lastLabel = "";
     joyF = 0; joyS = 0; joyT = 0;
     joyStopIfIdle();
+    if (bodyRolling) sendBodyRoll(0);
     sendGait("none");
     if (navigator.vibrate) { try { navigator.vibrate(20); } catch {} }
   }
@@ -365,8 +492,8 @@
 
   const DPAD = [
     { id: "dpad-up",    pos: "up",    label: "Body up",    path: "M12 6l7 10H5z" },
-    { id: "dpad-left",  pos: "left",  label: "Step left",  path: "M6 12l10-7v14z" },
-    { id: "dpad-right", pos: "right", label: "Step right", path: "M18 12L8 5v14z" },
+    { id: "dpad-left",  pos: "left",  label: "Roll body left",  path: "M6 12l10-7v14z" },
+    { id: "dpad-right", pos: "right", label: "Roll body right", path: "M18 12L8 5v14z" },
     { id: "dpad-down",  pos: "down",  label: "Body down",  path: "M12 18L5 8h14z" },
   ];
 </script>
@@ -380,7 +507,7 @@
       class:active={s.active}
       role="slider"
       tabindex="0"
-      aria-label={which === "move" ? "Move stick: drag to walk" : "Look stick: drag to look around"}
+      aria-label={which === "move" ? "Move stick: drag to walk" : move.active ? "Turn stick: drag left or right to turn" : "Look stick: drag to look around"}
       aria-valuemin="0"
       aria-valuemax="100"
       aria-valuenow={Math.round(Math.min(1, Math.hypot(s.nx, s.ny)) * 100)}
@@ -391,7 +518,9 @@
     >
       <span class="well-ring" aria-hidden="true"></span>
       <span class="knob" class:held={s.active} style="transform: translate({s.dx}px, {s.dy}px)" aria-hidden="true">
-        {#if which === "look"}
+        {#if which === "look" && move.active}
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12a8 8 0 0 1 14-5.3M20 12a8 8 0 0 1-14 5.3"/><path d="M18 3v4h-4M6 21v-4h4"/></svg>
+        {:else if which === "look"}
           <span class="knob-eyes"><i></i><i></i></span>
         {:else}
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v18M3 12h18M12 3l-3 3M12 3l3 3M12 21l-3-3M12 21l3-3M3 12l3-3M3 12l3 3M21 12l-3-3M21 12l-3 3"/></svg>
@@ -401,7 +530,7 @@
     {#if which === "move"}
       <span class="cap">Move</span>
     {:else}
-      <span class="cap">Look</span>
+      <span class="cap">{move.active ? "Turn" : "Look"}</span>
     {/if}
   </div>
 {/snippet}
