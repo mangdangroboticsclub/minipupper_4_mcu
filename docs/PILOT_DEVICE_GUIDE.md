@@ -207,7 +207,7 @@ nothing to announce.
 
 | Menu entry | Symbol | Value |
 |---|---|---|
-| Wi-Fi AP SSID | `APP_AP_SSID` | `MPX-Dog` unless you need a different one per bench |
+| Wi-Fi AP SSID prefix | `APP_AP_SSID` | `MPX-Dog`; the default AP name adds the last three soft-AP MAC bytes, e.g. `MPX-Dog-A1B2C3` |
 | Wi-Fi AP password | `APP_AP_PASSWORD` | empty = open AP (default); set one for a shared lab |
 | Cloud chat backend server IP or hostname | `APP_CHAT_SERVER_IP` | `echo`, or your gateway's address |
 | Cloud chat backend server port | `APP_CHAT_SERVER_PORT` | `8080` |
@@ -276,8 +276,9 @@ recoverable — but do not do it on a unit that is `locked` and offline).
 
 A pilot unit needs STA connectivity to reach the gateway. Two ways:
 
-**PWA (usual):** connect to `MPX-Dog` (open by default), open
-`http://192.168.2.1`, go to the Wi-Fi page, scan, enter credentials. Enterprise
+**PWA (usual):** connect to the robot's `MPX-Dog-XXXXXX` network (the suffix
+is its soft-AP MAC; open by default), open `http://192.168.2.1`, go to the
+Wi-Fi page, scan, enter credentials. Enterprise
 networks (eduroam etc.) additionally need the `identity` field.
 
 **API:**

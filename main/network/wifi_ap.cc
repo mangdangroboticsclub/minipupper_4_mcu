@@ -1,6 +1,7 @@
 #include "network/wifi_ap.h"
 #include "network/captive.h"
 
+#include <cstdio>
 #include <cstring>
 
 #include "esp_event.h"
@@ -209,9 +210,17 @@ bool init_wifi_ap()
             ESP_LOGI(TAG, "Using NVS-customised AP config — SSID: \"%s\"",
                      s_active_ssid.c_str());
         } else {
-            s_active_ssid     = WIFI_AP_SSID;
+            // The soft-AP MAC is unique per robot and matches the interface
+            // broadcasting this SSID. Three bytes keep collisions unlikely
+            // when several unconfigured robots are powered up together.
+            uint8_t mac[6];
+            ESP_ERROR_CHECK(esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP));
+            char suffix[8];
+            std::snprintf(suffix, sizeof(suffix), "-%02X%02X%02X",
+                          mac[3], mac[4], mac[5]);
+            s_active_ssid     = std::string(WIFI_AP_SSID) + suffix;
             s_active_password = WIFI_AP_PASSWORD;
-            ESP_LOGI(TAG, "Using compile-time default AP config — SSID: \"%s\"",
+            ESP_LOGI(TAG, "Using default AP config with MAC suffix — SSID: \"%s\"",
                      s_active_ssid.c_str());
         }
     }

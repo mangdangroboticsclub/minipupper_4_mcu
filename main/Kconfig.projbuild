@@ -11,10 +11,12 @@ config APP_LITTLEFS_PARTITION
         .wasm binaries and other persistent data.
 
 config APP_AP_SSID
-    string "Wi-Fi AP SSID"
+    string "Wi-Fi AP SSID prefix"
     default "MPX-Dog"
     help
-        SSID broadcast by the robot's soft-AP.
+        Base SSID broadcast by the robot's soft-AP. Unless a custom SSID is
+        saved in NVS, the last three soft-AP MAC bytes are appended in hex
+        (for example, MPX-Dog-A1B2C3) to distinguish nearby robots.
 
 config APP_AP_PASSWORD
     string "Wi-Fi AP password (empty = open)"

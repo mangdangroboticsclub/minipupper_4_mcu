@@ -32,8 +32,9 @@ constexpr const char *AP_GATEWAY  = "192.168.2.1";
  * @brief Initialize Wi-Fi in Soft-AP mode with a static IP.
  *
  * Sets up the ESP32 as an access point at 192.168.2.1.
- * Checks NVS for user-customised SSID/password first, falling back to
- * the compile-time defaults (WIFI_AP_SSID / WIFI_AP_PASSWORD).
+ * Checks NVS for user-customised SSID/password first. Without saved values,
+ * the default SSID is WIFI_AP_SSID plus the last three soft-AP MAC bytes
+ * (for example, "MPX-Dog-A1B2C3"), and the password is WIFI_AP_PASSWORD.
  * Must be called after nvs_flash_init() and before the HTTP server starts.
  *
  * @return true on success.
@@ -74,7 +75,7 @@ void wifi_ap_erase_config();
 /**
  * @brief Return the currently-active AP SSID.
  *
- * This is the SSID actually in use (NVS-customised or compile-time default).
+ * This is the SSID actually in use (NVS-customised or MAC-suffixed default).
  */
 const char *wifi_ap_get_ssid();
 
