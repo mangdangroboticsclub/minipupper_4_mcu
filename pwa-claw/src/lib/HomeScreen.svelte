@@ -1,6 +1,7 @@
 <script>
   import { colors } from "./colors.js";
   import Controller from "./Controller.svelte";
+  import Ps4Controller from "./Ps4Controller.svelte";
   import ActionIcon from "./ActionIcon.svelte";
   import ActionAssignment from "./ActionAssignment.svelte";
   import AddActionView from "./AddActionView.svelte";
@@ -23,6 +24,35 @@
 
   const online = $derived(network?.linkState === "online");
   const staConnected = $derived(network?.staState === "connected");
+
+  // Shared by Home and Settings; the robot, not this browser, owns the value.
+  let controlScheme = $state(null);
+  let controlSchemeReady = $state(false);
+  $effect(() => {
+    fetch("/v1/settings/control-scheme", { cache: "no-store" })
+      .then(async (r) => {
+        if (!r.ok) throw new Error("load failed");
+        const j = await r.json();
+        if (j?.scheme !== "PS4" && j?.scheme !== "Haris") throw new Error("invalid scheme");
+        controlScheme = j.scheme;
+        controlSchemeReady = true;
+      })
+      .catch(() => {
+        controlScheme = null;
+        controlSchemeReady = false;
+      });
+  });
+  async function selectControlScheme(scheme) {
+    if (!controlSchemeReady || scheme === controlScheme) return;
+    const r = await fetch("/v1/settings/control-scheme", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ scheme }),
+    });
+    if (!r.ok) throw new Error("save failed");
+    const j = await r.json();
+    controlScheme = j.scheme;
+  }
 
   // ── Moves catalogue ─────────────────────────────────────────
   const actions = [
@@ -335,13 +365,19 @@
 
           <div class="home-scroll">
             <div class="pad-wrap">
-              <Controller
-                wide={desktop}
-                assignments={actionAssignments}
-                catalog={allActions}
-                {online}
-                onEdit={() => (showActionAssignment = true)}
-              />
+              {#if controlScheme === "Haris"}
+                <Controller
+                  wide={desktop}
+                  assignments={actionAssignments}
+                  catalog={allActions}
+                  {online}
+                  onEdit={() => (showActionAssignment = true)}
+                />
+              {:else if controlScheme === "PS4"}
+                <Ps4Controller wide={desktop} {online} />
+              {:else}
+                <p class="controller-pending">Controller unavailable — reconnect to the robot.</p>
+              {/if}
             </div>
 
             <section class="quick" aria-labelledby="quick-title">
@@ -385,7 +421,12 @@
         <ChatView navigate={(to) => { if (to === "home") activeTab = "home"; }} {network} />
       </div>
     {:else if activeTab === "settings"}
-      <SettingsPage {network} />
+      <SettingsPage
+        {network}
+        {controlScheme}
+        {controlSchemeReady}
+        onControlScheme={selectControlScheme}
+      />
     {/if}
   </main>
 
@@ -402,15 +443,21 @@
   {#if showWide}
     <div class="wide-stage" class:rotated>
       <div class="wide-inner">
-        <Controller
-          wide
-          {rotated}
-          assignments={actionAssignments}
-          catalog={allActions}
-          {online}
-          onEdit={() => { exitWide(); showActionAssignment = true; }}
-          onExitWide={exitWide}
-        />
+        {#if controlScheme === "Haris"}
+          <Controller
+            wide
+            {rotated}
+            assignments={actionAssignments}
+            catalog={allActions}
+            {online}
+            onEdit={() => { exitWide(); showActionAssignment = true; }}
+            onExitWide={exitWide}
+          />
+        {:else if controlScheme === "PS4"}
+          <Ps4Controller wide {rotated} {online} onExitWide={exitWide} />
+        {:else}
+          <p class="controller-pending">Controller unavailable — reconnect to the robot.</p>
+        {/if}
       </div>
     </div>
   {/if}
@@ -564,4 +611,5 @@
     transform-origin: top left;
     transform: rotate(90deg);
   }
+  .controller-pending { margin: 0; padding: 48px 20px; text-align: center; color: var(--muted); font-size: 14px; }
 </style>

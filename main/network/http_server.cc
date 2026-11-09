@@ -8,6 +8,7 @@
 #include "network/wifi_ap.h"
 #include "network/wifi_sta.h"
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -43,6 +44,7 @@
 #include "wasm/wasm_sandbox.h"
 
 #include "lwip/sockets.h"
+#include "nvs_flash.h"
 #ifndef LWIP_SOCKET_OFFSET
 #define LWIP_SOCKET_OFFSET 0
 #endif
@@ -1165,6 +1167,37 @@ static esp_err_t api_robot_look(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* GET /v1/robot/attitude?roll=-25..25&pitch=-20..20&yaw=-30..30
+ * Direct body-attitude hold. Omitted axes return to neutral; the PWA d-pad
+ * uses roll alone so releasing either direction levels the body again. */
+static esp_err_t api_robot_attitude(httpd_req_t *req)
+{
+    float roll = 0.0f, pitch = 0.0f, yaw = 0.0f;
+    char query[96] = {};
+    bool valid = true;
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        auto parse_axis = [&](const char *name, float &axis) {
+            char val[16], *end = nullptr;
+            if (httpd_query_key_value(query, name, val, sizeof(val)) != ESP_OK) return;
+            axis = std::strtof(val, &end);
+            if (end == val || *end != '\0' || !std::isfinite(axis)) valid = false;
+        };
+        parse_axis("roll", roll);
+        parse_axis("pitch", pitch);
+        parse_axis("yaw", yaw);
+    }
+    if (!valid) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "attitude axes must be finite numbers", -1);
+        return ESP_OK;
+    }
+    if (robot::master_active()) return send_pi_in_control(req);
+    robot::set_body_attitude(roll, pitch, yaw);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, R"({"ok":true})", -1);
+    return ESP_OK;
+}
+
 /* /v1/robot/power — rest when unused (same JSON as mpv2-claw).
  *
  * GET  -> {"ok":true,"rest_after_s":300,"state":"holding","resting":false}
@@ -1269,6 +1302,84 @@ static esp_err_t api_agent_permissions_post(httpd_req_t *req)
         return ESP_OK;
     }
     send_permissions_json(req);
+    return ESP_OK;
+}
+
+/* /v1/settings/control-scheme — controller preference shared by every
+ * browser connected to this robot. NVS makes it survive reboots and avoids
+ * different phones silently selecting different controller behaviour. */
+static esp_err_t load_control_scheme(bool *haris)
+{
+    *haris = false;                 // A missing namespace/key means default PS4.
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open("ui", NVS_READONLY, &nvs);
+    if (err == ESP_ERR_NVS_NOT_FOUND) return ESP_OK;
+    if (err != ESP_OK) return err;
+
+    uint8_t scheme = 0;             // 0 = PS4, 1 = Haris
+    err = nvs_get_u8(nvs, "scheme", &scheme);
+    nvs_close(nvs);
+    if (err == ESP_ERR_NVS_NOT_FOUND) return ESP_OK;
+    if (err != ESP_OK) return err;
+    if (scheme > 1) return ESP_ERR_INVALID_STATE;
+    *haris = scheme == 1;
+    return ESP_OK;
+}
+
+static void send_control_scheme_json(httpd_req_t *req, bool haris)
+{
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, haris
+                    ? R"({"ok":true,"scheme":"Haris"})"
+                    : R"({"ok":true,"scheme":"PS4"})", -1);
+}
+
+static esp_err_t api_control_scheme_get(httpd_req_t *req)
+{
+    bool haris;
+    const esp_err_t err = load_control_scheme(&haris);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Could not read control scheme: %s", esp_err_to_name(err));
+        httpd_resp_set_status(req, "500 Server Error");
+        httpd_resp_send(req, "could not read the setting", -1);
+        return ESP_OK;
+    }
+    send_control_scheme_json(req, haris);
+    return ESP_OK;
+}
+
+static esp_err_t api_control_scheme_post(httpd_req_t *req)
+{
+    char buf[96] = {};
+    int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (len <= 0) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "empty body", -1);
+        return ESP_OK;
+    }
+    buf[len] = 0;
+
+    const std::string scheme = json_get_str(buf, "scheme");
+    if (scheme != "PS4" && scheme != "Haris") {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_send(req, "expected scheme PS4 or Haris", -1);
+        return ESP_OK;
+    }
+    const bool haris = scheme == "Haris";
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open("ui", NVS_READWRITE, &nvs);
+    if (err == ESP_OK) {
+        err = nvs_set_u8(nvs, "scheme", haris ? 1 : 0);
+        if (err == ESP_OK) err = nvs_commit(nvs);
+        nvs_close(nvs);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Could not save control scheme: %s", esp_err_to_name(err));
+        httpd_resp_set_status(req, "500 Server Error");
+        httpd_resp_send(req, "could not save the setting", -1);
+        return ESP_OK;
+    }
+    send_control_scheme_json(req, haris);
     return ESP_OK;
 }
 
@@ -3049,10 +3160,13 @@ bool start_http_server()
     // ── Ported from mpv2-claw (see .cursor/PORT_NOTES.md) ──
     register_api(s_server, "GET",  "/v1/robot/moves",          HTTP_GET,  api_robot_moves);
     register_api(s_server, "GET",  "/v1/robot/look",           HTTP_GET,  api_robot_look);
+    register_api(s_server, "GET",  "/v1/robot/attitude",       HTTP_GET,  api_robot_attitude);
     register_api(s_server, "GET",  "/v1/robot/power",          HTTP_GET,  api_robot_power_get);
     register_api(s_server, "POST", "/v1/robot/power",          HTTP_POST, api_robot_power_post);
     register_api(s_server, "GET",  "/v1/agent/permissions",    HTTP_GET,  api_agent_permissions_get);
     register_api(s_server, "POST", "/v1/agent/permissions",    HTTP_POST, api_agent_permissions_post);
+    register_api(s_server, "GET",  "/v1/settings/control-scheme", HTTP_GET,  api_control_scheme_get);
+    register_api(s_server, "POST", "/v1/settings/control-scheme", HTTP_POST, api_control_scheme_post);
     register_api(s_server, "POST", "/v1/robot/config",         HTTP_POST, api_robot_config);
     register_api(s_server, "GET",  "/v1/robot/config",         HTTP_GET,  api_robot_get_config);
     register_api(s_server, "POST", "/v1/robot/calibrate",      HTTP_POST, api_robot_calibrate);

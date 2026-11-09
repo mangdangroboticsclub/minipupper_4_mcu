@@ -3,8 +3,10 @@
   import { colors } from "./lib/colors.js";
   import LockScreen from "./lib/LockScreen.svelte";
   import PermissionCard from "./lib/PermissionCard.svelte";
+  import { recordSuccessfulConnection, shouldShowWelcome } from "./lib/welcomeGate.js";
 
   const YELLOW = colors.mpx.primary;
+  const showWelcome = shouldShowWelcome();
 
   // ── Network status (polled from robot) ──────────────────────
   let apIp = $state("192.168.2.1");
@@ -51,6 +53,7 @@
       networkLoaded = true;
       latencyMs = Math.round(performance.now() - t0);
       lastSeenAt = Date.now();
+      recordSuccessfulConnection(lastSeenAt);
       failStreak = 0;
       linkState = "online";
     } catch {
@@ -233,7 +236,7 @@
   });
 </script>
 
-<LockScreen {network} />
+<LockScreen {network} {showWelcome} />
 
 <!-- ═══ Global Permission Modal Overlay ═══ -->
 {#if pendingActions.length > 0}

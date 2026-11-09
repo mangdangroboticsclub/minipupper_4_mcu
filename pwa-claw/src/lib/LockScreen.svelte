@@ -1,8 +1,9 @@
 <script>
   import { colors } from "./colors.js";
   import WelcomeScreen from "./WelcomeScreen.svelte";
+  import HomeScreen from "./HomeScreen.svelte";
 
-  let { network } = $props();
+  let { network, showWelcome = true } = $props();
 
   /** "locked" → "unlocked" → "final" */
   let phase = $state("locked");
@@ -150,9 +151,13 @@
   </div>
   {/if}
 
-  <!-- ═══ FINAL SCREEN → Welcome / Setup ═══ -->
+  <!-- ═══ FINAL SCREEN → Home for recent connections, otherwise Setup ═══ -->
   {#if isFinal}
-    <WelcomeScreen {network} />
+    {#if showWelcome}
+      <WelcomeScreen {network} />
+    {:else}
+      <HomeScreen {network} />
+    {/if}
   {/if}
 </div>
 

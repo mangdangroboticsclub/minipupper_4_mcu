@@ -44,6 +44,61 @@ static void secure_zero(void *ptr, size_t len)
 
 namespace wasm {
 
+// Outcome of one payload-decryption attempt. AuthFail and Oom are kept apart
+// because they map to different DecryptResult values.
+enum class PayloadTry { Ok, AuthFail, Oom };
+
+// Decrypt the WASM payload assuming the frame ends after `ct_len` bytes of
+// ciphertext, i.e. the tag is the 16 bytes at OFF_ENCRYPTED_WASM + ct_len.
+//
+// The format has no length field, so the tag is located purely by position
+// (file_size - 16). That makes the frame sensitive to any byte appended at the
+// end by whatever wrote the file: the tag window shifts by one and the GCM
+// check fails even though every field before it is intact.
+static PayloadTry decrypt_payload_try(const uint8_t *data, size_t data_size,
+                                     size_t ct_len, const uint8_t *skill_key,
+                                     const char *aad, size_t aad_len,
+                                     uint8_t **out_plaintext, size_t *out_size)
+{
+    *out_plaintext = nullptr;
+    *out_size = 0;
+
+    const uint8_t *encrypted_wasm = data + OFF_ENCRYPTED_WASM;
+    const uint8_t *wasm_tag = encrypted_wasm + ct_len;
+
+    // The tag must be fully inside the buffer. malloc(0) is avoided because a
+    // zero-byte payload is not a valid frame.
+    if (ct_len == 0 ||
+        OFF_ENCRYPTED_WASM + ct_len + GCM_TAG_SIZE > data_size) {
+        return PayloadTry::AuthFail;
+    }
+
+    uint8_t *plaintext = static_cast<uint8_t *>(std::malloc(ct_len));
+    if (!plaintext) {
+        ESP_LOGE(TAG, "OOM allocating %zu bytes for decrypted WASM", ct_len);
+        return PayloadTry::Oom;
+    }
+
+    const bool ok = crypto::gcm_decrypt(
+        skill_key,
+        data + OFF_WASM_IV,
+        reinterpret_cast<const uint8_t *>(aad),
+        aad_len,
+        encrypted_wasm, ct_len,
+        wasm_tag,
+        plaintext);
+
+    if (!ok) {
+        secure_zero(plaintext, ct_len);
+        std::free(plaintext);
+        return PayloadTry::AuthFail;
+    }
+
+    *out_plaintext = plaintext;
+    *out_size = ct_len;
+    return PayloadTry::Ok;
+}
+
 // The two key sizes are the same number for the same reason: 32 bytes is the
 // AES-256 key the identity holds and the one the MPXE header wraps.
 static_assert(crypto::KEY_SIZE == MPX_KEY_LEN,
@@ -78,11 +133,8 @@ static DecryptResult decrypt_mpxe_core(const uint8_t *data, size_t data_size,
     const uint8_t *wrap_iv         = data + OFF_WRAP_IV;
     const uint8_t *wrapped_key_ct  = data + OFF_WRAPPED_KEY;       // 48 bytes (32 ct + 16 tag)
     const uint8_t *blob_skill_hash = data + OFF_SKILL_ID_HASH;     // 8 bytes
-    const uint8_t *wasm_iv         = data + OFF_WASM_IV;
-    const uint8_t *encrypted_wasm  = data + OFF_ENCRYPTED_WASM;
 
     size_t wasm_ct_len = data_size - OFF_ENCRYPTED_WASM - GCM_TAG_SIZE;
-    const uint8_t *wasm_tag = data + OFF_ENCRYPTED_WASM + wasm_ct_len;
 
     // ── Step 2: Load robot key ───────────────────────────────
     // No Kconfig parse and no "is it all zeros" check here any more: both live
@@ -131,35 +183,54 @@ static DecryptResult decrypt_mpxe_core(const uint8_t *data, size_t data_size,
     int wasm_aad_len = snprintf(wasm_aad_buf, sizeof(wasm_aad_buf),
                                 "wasm-skill:v1:%s", hash_hex);
 
-    uint8_t *plaintext = static_cast<uint8_t *>(std::malloc(wasm_ct_len));
-    if (!plaintext) {
-        ESP_LOGE(TAG, "OOM allocating %zu bytes for decrypted WASM", wasm_ct_len);
-        secure_zero(skill_key, sizeof(skill_key));
-        return DecryptResult::OutOfMemory;
-    }
+    uint8_t *plaintext = nullptr;
+    size_t plaintext_len = 0;
+    PayloadTry attempt = decrypt_payload_try(data, data_size, wasm_ct_len,
+                                            skill_key, wasm_aad_buf,
+                                            static_cast<size_t>(wasm_aad_len),
+                                            &plaintext, &plaintext_len);
 
-    bool decrypt_ok = crypto::gcm_decrypt(
-        skill_key,
-        wasm_iv,
-        reinterpret_cast<const uint8_t *>(wasm_aad_buf),
-        static_cast<size_t>(wasm_aad_len),
-        encrypted_wasm, wasm_ct_len,
-        wasm_tag,
-        plaintext);
+    // A byte appended after the tag moves the tag window by one, so the
+    // canonical frame is rejected while every header field still verifies.
+    // Retry the same frame one byte shorter — still an authenticated check of
+    // the exact ciphertext, not a relaxed one — and say so loudly, because the
+    // real defect is in whatever wrote the file.
+    bool had_trailing_byte = false;
+    if (attempt == PayloadTry::AuthFail && wasm_ct_len > 0) {
+        attempt = decrypt_payload_try(data, data_size, wasm_ct_len - 1,
+                                      skill_key, wasm_aad_buf,
+                                      static_cast<size_t>(wasm_aad_len),
+                                      &plaintext, &plaintext_len);
+        if (attempt == PayloadTry::Ok) {
+            had_trailing_byte = true;
+        }
+    }
 
     secure_zero(skill_key, sizeof(skill_key));
 
-    if (!decrypt_ok) {
-        ESP_LOGE(TAG, "WASM decryption failed — blob is corrupted or tampered");
-        secure_zero(plaintext, wasm_ct_len);
-        std::free(plaintext);
+    if (attempt == PayloadTry::Oom) {
+        return DecryptResult::OutOfMemory;
+    }
+
+    if (attempt != PayloadTry::Ok) {
+        ESP_LOGE(TAG, "WASM decryption failed — blob is corrupted or tampered "
+                 "(size=%zu, ciphertext=%zu, tag@%zu)",
+                 data_size, wasm_ct_len, OFF_ENCRYPTED_WASM + wasm_ct_len);
         return DecryptResult::DecryptFailed;
     }
 
-    ESP_LOGI(TAG, "WASM decrypted successfully (%zu bytes plaintext)", wasm_ct_len);
+    if (had_trailing_byte) {
+        ESP_LOGW(TAG, "MPXE blob has a stray trailing byte: %zu bytes on disk, "
+                 "authenticated frame ends at %zu. Decrypting the valid frame; "
+                 "the writer appended a byte after the GCM tag (check the deploy "
+                 "script's byte count against what fs.write receives)",
+                 data_size, data_size - 1);
+    }
+
+    ESP_LOGI(TAG, "WASM decrypted successfully (%zu bytes plaintext)", plaintext_len);
 
     *out_plaintext = plaintext;
-    *out_size = wasm_ct_len;
+    *out_size = plaintext_len;
     return DecryptResult::Success;
 }
 
