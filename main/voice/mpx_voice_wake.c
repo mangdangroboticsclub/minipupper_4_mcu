@@ -861,6 +861,21 @@ bool mpx_voice_wake_auto_active(void)
     return s_auto_active;
 }
 
+esp_err_t mpx_voice_wake_trigger(void)
+{
+    if (!s_auto_active || !s_detected) return ESP_ERR_INVALID_STATE;
+    ESP_LOGI(TAG, "software wake -- same as the WAKE button");
+    if (mpx_voice_stream_is_playing()) {
+        mpx_voice_stream_abort_playback();
+        send_abort_wake_word();
+    }
+    /* Match the physical button: make fetch() leave its loop promptly, then
+     * wake the orchestrator. It remains the sole owner of the mic handoff. */
+    s_run = false;
+    xSemaphoreGive(s_detected);
+    return ESP_OK;
+}
+
 /* ── status, for /v1/voice ───────────────────────────────────────────────── */
 
 void mpx_voice_wake_last_seen(float *volume_dbfs, int *vad, float *ringbuf_free)

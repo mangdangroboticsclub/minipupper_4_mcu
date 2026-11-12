@@ -10,8 +10,9 @@
  *
  * The bridge: chat_ws.cc hands a conversation's message in with submit();
  * the agent's replies and progress notes come back through the one outbound
- * callback (set_outbound), on the agent's task. The session id is the PWA's
- * conversation id, so ESP-Claw's session history is per conversation.
+ * callback (set_outbound), on the agent's task. Voice can register one
+ * additional listener without replacing the PWA callback. The session id is
+ * the conversation id, so ESP-Claw's session history is per conversation.
  *
  * Compiled with the agent off too (CONFIG_APP_AGENT_ENABLE=n): then
  * available() is false, start() is a no-op and submit() refuses.
@@ -47,6 +48,13 @@ esp_err_t apply_config();
  */
 esp_err_t submit(const char *session_id, const char *text);
 
+/** Voice variant: asks for one concise direct response, avoiding unnecessary
+ *  tool/agent rounds while retaining tools for explicit physical actions. */
+esp_err_t submit_voice(const char *session_id, const char *text);
+
+/** Delete ESP-Claw's public session-history artifacts for one conversation. */
+esp_err_t clear_session(const char *session_id);
+
 /**
  * Where the agent's output goes. is_step is true for a progress note (ESP-
  * Claw prefixes those with the lobster, U+1F99E, which is stripped) and
@@ -55,5 +63,11 @@ esp_err_t submit(const char *session_id, const char *text);
  */
 using OutboundFn = void (*)(const char *session_id, const char *text, bool is_step);
 void set_outbound(OutboundFn fn);
+
+/** One additional outbound consumer (the voice bridge). Return true when the
+ *  frame was consumed, suppressing the generic PWA frame to avoid duplicates.
+ *  The same threading and no-blocking rules as set_outbound() apply. */
+using OutboundListenerFn = bool (*)(const char *session_id, const char *text, bool is_step);
+void set_outbound_listener(OutboundListenerFn fn);
 
 }  // namespace agent

@@ -84,6 +84,7 @@ add_executable(mpx_host_tests
     test_harness.c
     ${MPX_TEST_SOURCES}
     ${MPX_IDENTITY_SOURCES}
+    ${MPX_REPO_ROOT}/main/voice/voice_brain_text.c
     "${MPX_VECTORS_HEADER}"
     "${MPX_SEAL_HEADER}"
 )
@@ -93,6 +94,7 @@ target_include_directories(mpx_host_tests PRIVATE
     "${MPX_GENERATED_DIR}"
     "${MPX_REPO_ROOT}/components/mpx_identity"
     "${MPX_REPO_ROOT}/components/mpx_identity/include"
+    "${MPX_REPO_ROOT}/main/voice"
 )
 
 if(OpenSSL_FOUND)

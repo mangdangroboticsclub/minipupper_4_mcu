@@ -90,6 +90,9 @@ if(CONFIG_APP_VOICE_ENABLE)
         "voice/mpx_voice_stream.c"
         "voice/mpx_voice_wake.c"
         "voice/cap_music.c"
+        "voice/voice_brain.cc"
+        "voice/voice_brain_text.c"
+        "voice/voice_history.cc"
         "voice/voice_tools.cc"
     )
 endif()
@@ -215,6 +218,9 @@ idf_component_register(
         claw_cap
         cap_im_local
         claw_event_router
+        # claw_memory's public delete-session-history helper, used when the
+        # voice panel clears a conversation's context.
+        claw_memory
 )
 
 # The only references to the custom table's field descriptors come from

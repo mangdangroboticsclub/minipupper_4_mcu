@@ -61,6 +61,15 @@ esp_err_t chat_ws_handler(httpd_req_t *req);
  */
 void pwa_release_fd(httpd_handle_t hd, int sockfd);
 
+/** True while a live phone WebSocket owns this fd. The socket reaper must not
+ *  treat a registered chat socket as an orphan: the two use the same fd table,
+ *  and closing a live one shows up on the phone as "the web socket just dies". */
+bool chat_ws_owns_fd(int sockfd);
+
+/** Broadcast a pre-encoded voice event to every open chat socket, regardless
+ *  of the text session each socket is viewing. Caller supplies JSON text. */
+void broadcast_voice_to_pwa(const char *json_text);
+
 /**
  * @brief REST handler for POST /v1/chat/send.
  *

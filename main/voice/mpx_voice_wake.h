@@ -92,6 +92,11 @@ void mpx_voice_wake_auto_stop(void);
 
 bool mpx_voice_wake_auto_active(void);
 
+/* Software equivalent of the WAKE button / wake word. The auto loop owns the
+ * microphone handoff, so this only posts a trigger; it also works as barge-in
+ * while a reply is playing. ESP_ERR_INVALID_STATE when hands-free is off. */
+esp_err_t mpx_voice_wake_trigger(void);
+
 /* True while the hands-free loop is in a conversation turn: after the wake
  * word, while the microphone streams to the server, and while the reply
  * arrives and plays. False while it just listens for the wake word. */

@@ -6,12 +6,11 @@
  * mpx_voice_wake, cap_music and the MCP bridge, in one place.
  *
  *   - The owner's choice, "AI & Voice" in the app (GET/POST /v1/ai), which
- *     agent_config owns since Phase 5: mangdang and own (voice goes to the
- *     MangDang voice gateway; the wake word works) or off (no voice, the
- *     microphone never opens). In "own" the on-device agent uses the
- *     owner's LLM for chat, but a voice turn is still answered by the
- *     gateway -- the voice -> local agent handoff is later work. Saved in
- *     NVS; applied live, no restart.
+ *     agent_config owns since Phase 5: mangdang and own (voice goes through
+ *     the MangDang voice gateway; the wake word works) or off (no voice, the
+ *     microphone never opens). With APP_VOICE_BRAIN_LOCAL the gateway only
+ *     transcribes and speaks, and the on-device agent answers in either mode.
+ *     Saved in NVS; applied live, no restart.
  *   - Boot: the face hooks (what was heard / said / felt goes on the screen),
  *     the music player, the tool bridge, then esp-sr's front end and the
  *     hands-free loop when the mode allows.
@@ -52,6 +51,10 @@ void on_master_changed(bool active);
  *  /v1/voice after "could not start". */
 esp_err_t hands_free_start();
 void      hands_free_stop();
+
+/** Start listening immediately, without waiting for the wake word. Starts
+ *  hands-free first if needed, then follows the physical WAKE button path. */
+esp_err_t wake_now();
 
 /** Provision against the gateway now (normally automatic on first use). */
 esp_err_t provision();

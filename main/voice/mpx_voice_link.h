@@ -237,20 +237,26 @@ void mpx_voice_set_ui_hooks(const mpx_voice_ui_hooks_t *hooks);
  * {"type":"goodbye","reason":"stop"}. cap_music stops the music. */
 void mpx_voice_set_quiet_hook(void (*hook)(void));
 
-/* ── Device brain ("own" AI mode) ──────────────────────────────────────────
+/* ── Device brain ─────────────────────────────────────────────────────────
  *
  * Normally the server answers: it transcribes, asks its own LLM, speaks the
  * reply. With the device brain on, the hello advertises features.brain =
  * "device" and the server stops after transcribing: it sends the "stt" text
  * here and waits for the robot to say what to speak, as
- * {"type":"speak","text":...,"last":true}. The robot's own agent -- with the
- * owner's own LLM key, which never leaves the robot -- writes that answer.
+ * {"type":"speak","text":...,"last":true}. The robot's ESP-Claw agent writes
+ * that answer (using the gateway LLM in mangdang mode, or the owner's account
+ * in own mode).
  *
  * The sink receives each transcript as a heap copy it must free(). It runs on
  * the websocket task, so it must only queue the text, never block. */
 typedef void (*mpx_voice_stt_sink_t)(char *text_owned);
 
 void mpx_voice_set_device_brain(bool on, mpx_voice_stt_sink_t sink);
+
+/* Optional queued consumer for "thinking", "speaking" and "idle" UI state.
+ * Called on the websocket task; the callback must only copy and queue. */
+typedef void (*mpx_voice_state_sink_t)(const char *state);
+void mpx_voice_set_state_sink(mpx_voice_state_sink_t sink);
 bool mpx_voice_device_brain(void);
 /* Send what the robot's brain wants spoken; `last` ends the reply. */
 esp_err_t mpx_voice_send_speak(const char *text, bool last);

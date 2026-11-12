@@ -15,8 +15,8 @@
  *              on the robot, nobody types one.
  *   own        the owner's own LLM account (backend, URL, model, key),
  *              entered in Settings > AI & Voice (POST /v1/ai) and stored in
- *              NVS. The agent uses it; voice still goes through the gateway
- *              for now (the voice -> local agent handoff is later work).
+ *              NVS. The agent uses it for text and, with device-brain voice,
+ *              spoken turns; the gateway still provides STT and TTS.
  *   off        no AI: voice off, the microphone never opens, the agent
  *              refuses chat.
  *

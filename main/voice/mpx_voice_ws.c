@@ -35,12 +35,21 @@ static const char *TAG = "mpx_voice_ws";
 #define VOICE_HANDSHAKE_MS   8000
 
 /* The websocket client runs the event handler on its own task, and this
- * parses JSON there. 6 KB rather than the 4 KB default, because cJSON's
- * recursive descent plus a log line is not free and a stack overflow in a
- * callback is a miserable thing to diagnose. */
-#define VOICE_WS_TASK_STACK  6144
+ * parses JSON there, so the component's 4 KB default is the floor and 6 KB was
+ * the comfortable choice. It cannot be 6 KB: `xTaskCreatePinnedToCore` needs
+ * one contiguous internal block, and with the local agent running the largest
+ * free internal block measured 4864 bytes at wake time -- so a 6 KB stack made
+ * every connect fail with "Error create websocket task" before a single byte
+ * reached the server. 4096 always fits, and the JSON this callback parses
+ * (hello/stt/tts control frames) is shallow. */
+#define VOICE_WS_TASK_STACK  4096
 
 static esp_websocket_client_handle_t s_client;
+/* MCP, local-brain and mode-change tasks can race. The component send lock
+ * does not protect the handle from close+destroy, so hold this outer lock for
+ * the whole send and the whole destroy. */
+static StaticSemaphore_t s_client_lock_storage;
+static SemaphoreHandle_t s_client_lock;
 static mpx_voice_state_t s_state = MPX_VOICE_IDLE;
 static char s_session_id[VOICE_SESSION_ID_MAX];
 static uint32_t s_downlink_rate = MPX_VOICE_DOWNLINK_RATE;
@@ -50,11 +59,22 @@ static mpx_voice_mcp_sink_t s_mcp_sink;
 static mpx_voice_ui_hooks_t s_ui;   /* zeroed = no hooks */
 static bool s_device_brain;
 static mpx_voice_stt_sink_t s_stt_sink;
+static mpx_voice_state_sink_t s_state_sink;
+
+static void notify_state_sink(const char *state)
+{
+    if (s_state_sink) s_state_sink(state);
+}
 
 void mpx_voice_set_device_brain(bool on, mpx_voice_stt_sink_t sink)
 {
     s_device_brain = on && sink != NULL;
     s_stt_sink = sink;
+}
+
+void mpx_voice_set_state_sink(mpx_voice_state_sink_t sink)
+{
+    s_state_sink = sink;
 }
 
 bool mpx_voice_device_brain(void)
@@ -116,25 +136,36 @@ static bool s_socket_opened;
 
 esp_err_t mpx_voice_send_json(const char *json)
 {
-    ESP_RETURN_ON_FALSE(s_client && json, ESP_ERR_INVALID_STATE, TAG, "not connected");
-
+    ESP_RETURN_ON_FALSE(json && s_client_lock, ESP_ERR_INVALID_STATE, TAG, "not connected");
+    xSemaphoreTake(s_client_lock, portMAX_DELAY);
+    if (!s_client) {
+        xSemaphoreGive(s_client_lock);
+        return ESP_ERR_INVALID_STATE;
+    }
     const int len = (int)strlen(json);
     const int sent = esp_websocket_client_send_text(s_client, json, len,
                                                     pdMS_TO_TICKS(VOICE_WS_SEND_JSON_MS));
+    xSemaphoreGive(s_client_lock);
     ESP_RETURN_ON_FALSE(sent == len, ESP_FAIL, TAG, "send failed (%d of %d)", sent, len);
     return ESP_OK;
 }
 
 esp_err_t mpx_voice_send_binary(const uint8_t *data, size_t len)
 {
-    ESP_RETURN_ON_FALSE(s_client && data && len, ESP_ERR_INVALID_STATE, TAG, "not connected");
+    ESP_RETURN_ON_FALSE(data && len && s_client_lock, ESP_ERR_INVALID_STATE, TAG, "not connected");
 
     /* Same call as send_text -- esp_websocket_client picks the frame opcode
      * (binary vs. text) from which of the two functions you call, not from
      * the bytes. Uplink Opus packets go out as 0x02 this way, matching what
      * the server sends us and what voice_ws_event's op_code check expects. */
+    xSemaphoreTake(s_client_lock, portMAX_DELAY);
+    if (!s_client) {
+        xSemaphoreGive(s_client_lock);
+        return ESP_ERR_INVALID_STATE;
+    }
     const int sent = esp_websocket_client_send_bin(s_client, (const char *)data, (int)len,
                                                     pdMS_TO_TICKS(VOICE_WS_SEND_AUDIO_MS));
+    xSemaphoreGive(s_client_lock);
     ESP_RETURN_ON_FALSE(sent == (int)len, ESP_FAIL, TAG, "binary send failed (%d of %u)",
                         sent, (unsigned)len);
     return ESP_OK;
@@ -167,12 +198,14 @@ static esp_err_t voice_send_hello(void)
     cJSON_AddNumberToObject(root, "version", 1);
     cJSON_AddStringToObject(root, "transport", "websocket");
 
-    /* mcp:true is the flag that lets the server call back into this device.
-     * It is what Phase 3 needs -- the server's model asking the robot to
-     * change its face -- and it costs nothing to advertise now. */
+    /* Exactly one brain: with device brain the server transcribes and speaks
+     * but never starts MCP, while mcp:true selects the server's own model.
+     * Advertising both would silently discard the MCP bridge. */
     cJSON *features = cJSON_AddObjectToObject(root, "features");
     if (features) {
-        cJSON_AddBoolToObject(features, "mcp", true);
+        if (!s_device_brain) {
+            cJSON_AddBoolToObject(features, "mcp", true);
+        }
         /* The robot shapes its own speaker (mpx_audio `audio tune`): the
          * server then sends speech as the TTS made it. */
         if (mpx_audio_speaker_dsp()) {
@@ -255,6 +288,7 @@ static void voice_handle_text(const char *data, int len)
         if (s_ui.heard && cJSON_IsString(text)) {
             s_ui.heard(text->valuestring);
         }
+        if (s_device_brain) notify_state_sink("thinking");
         if (s_device_brain && s_stt_sink && cJSON_IsString(text) && text->valuestring[0]) {
             char *copy = strdup(text->valuestring);
             if (copy) {
@@ -279,11 +313,13 @@ static void voice_handle_text(const char *data, int len)
          * is the other way an auto-mode talk learns the server took its
          * turn -- some servers send tts start before, or instead of, stt. */
         if (strcmp(state_str, "stop") == 0) {
+            notify_state_sink("idle");
             mpx_voice_stream_on_tts_stop();
             if (s_ui.reply_done) {
                 s_ui.reply_done();
             }
         } else {
+            notify_state_sink("speaking");
             mpx_voice_stream_on_server_turn();
             if (s_ui.saying && strcmp(state_str, "sentence_start") == 0 && cJSON_IsString(text)) {
                 s_ui.saying(text->valuestring);
@@ -315,6 +351,7 @@ static void voice_handle_text(const char *data, int len)
             }
         }
     } else if (strcmp(kind, "goodbye") == 0) {
+        notify_state_sink("idle");
         /* The server is ending the conversation -- after you said goodbye,
          * or after its own idle timeout (it says "bye" out loud first, then
          * sends this, then closes the socket). Nothing to send back; the
@@ -404,6 +441,10 @@ static void voice_ws_event(void *arg, esp_event_base_t base,
 
 esp_err_t mpx_voice_connect(const char *url, const char *token)
 {
+    if (!s_client_lock) {
+        s_client_lock = xSemaphoreCreateMutexStatic(&s_client_lock_storage);
+    }
+    ESP_RETURN_ON_FALSE(s_client_lock, ESP_ERR_NO_MEM, TAG, "client lock failed");
     char headers[VOICE_HEADER_MAX];
     uint8_t mac[6] = {0};
 
@@ -477,13 +518,21 @@ esp_err_t mpx_voice_connect(const char *url, const char *token)
     /* Internal RAM before and after, because the websocket client takes its
      * buffers from it and this firmware has very little to give. When the
      * panel starts logging ESP_ERR_NO_MEM the moment a socket opens, these
-     * two numbers are the evidence. */
-    ESP_LOGI(TAG, "internal RAM before connect: %u free, %u largest",
+     * two numbers are the evidence. The "largest" figure is the one that
+     * decides esp_websocket_client_start(): it must exceed
+     * VOICE_WS_TASK_STACK or the client task cannot be created at all. */
+    ESP_LOGI(TAG, "internal RAM before connect: %u free, %u largest (task needs %d)",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
-             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (int)VOICE_WS_TASK_STACK);
 
     const esp_err_t err = esp_websocket_client_start(s_client);
     if (err != ESP_OK) {
+        if (heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) <
+            (size_t)VOICE_WS_TASK_STACK) {
+            ESP_LOGE(TAG, "no contiguous internal RAM for the websocket task -- "
+                          "something else is holding it");
+        }
         mpx_voice_disconnect();
         return err;
     }
@@ -517,13 +566,19 @@ esp_err_t mpx_voice_connect(const char *url, const char *token)
 
 void mpx_voice_disconnect(void)
 {
+    if (!s_client_lock) {
+        return;
+    }
+    xSemaphoreTake(s_client_lock, portMAX_DELAY);
     if (!s_client) {
+        xSemaphoreGive(s_client_lock);
         return;
     }
     esp_websocket_client_close(s_client, pdMS_TO_TICKS(1000));
     esp_websocket_client_destroy(s_client);
     s_client = NULL;
     s_state = MPX_VOICE_IDLE;
+    xSemaphoreGive(s_client_lock);
     s_session_id[0] = '\0';
     (void)esp_wifi_set_ps(WIFI_PS_NONE);      /* was MIN_MODEM: it made the AP (192.168.2.1) laggy */
     ESP_LOGI(TAG, "disconnected");

@@ -12,14 +12,20 @@
   import ChatMessage from "./ChatMessage.svelte";
   import AgentActivity from "./AgentActivity.svelte";
   import EmptyChat from "./EmptyChat.svelte";
+  import VoicePanel from "./VoicePanel.svelte";
   import {
     saveConversation,
     getConversation,
+    listConversations,
     generateUUID,
     BRAINS,
     normalizeBrain,
     getPreferredBrain,
     setPreferredBrain,
+    appendVoiceTurn,
+    importVoiceHistory,
+    markConversationRead,
+    clearConversationMessages,
   } from "../conversationStore.js";
 
   /**
@@ -63,6 +69,61 @@
   let scrollAnchor = $state(null);
   let inputEl = $state(null);
   let pendingActions = $state([]);
+  let conversationArchived = $state(false);
+  let voiceState = $state({ state: "idle", id: null });
+  let voiceWakeBusy = $state(false);
+  let voiceWakeError = $state("");
+  let voiceWakeRequested = $state(false);
+  let showVoicePanel = $state(false);
+  let voicePanelId = $state(null);
+  let voicePanelConversation = $derived.by(() => {
+    sidebarRefreshKey;
+    return voicePanelId ? getConversation(voicePanelId) : null;
+  });
+  let voicePanelState = $derived(
+    voiceState.id && voiceState.id === voicePanelId ? voiceState.state : "idle",
+  );
+  let voiceWakeMode = $derived(
+    messages.length === 0 && !inputText.trim() && !sending && !conversationArchived,
+  );
+
+  /* Surface only the newest robot-owned voice transcript beside the composer.
+   * Older conversations remain in History; a row of chips made the chat header
+   * busy without showing enough of the conversation to be useful. */
+  let latestVoice = $derived.by(() => {
+    sidebarRefreshKey;  /* the store is not reactive; this is the tick */
+    return listConversations().find((c) => c.source === "voice") || null;
+  });
+  let latestVoiceLive = $derived(
+    voiceState.state !== "idle" &&
+      (!latestVoice || !voiceState.id || voiceState.id === latestVoice.id),
+  );
+
+  function voiceTitle(convo) {
+    const first = (convo.messages || []).find((m) => m.role === "user");
+    return (first?.text || convo.title || "Voice chat").trim();
+  }
+
+  function voiceReply(convo) {
+    const turns = convo.messages || [];
+    for (let i = turns.length - 1; i >= 0; i--) {
+      if (turns[i].role === "bot" || turns[i].role === "assistant") {
+        return turns[i].text.trim();
+      }
+    }
+    return "";
+  }
+
+  function voiceWhen(convo) {
+    const ts = convo.updatedAt || convo.createdAt;
+    if (!ts) return "";
+    const d = new Date(ts);
+    const now = new Date();
+    const sameDay = d.toDateString() === now.toDateString();
+    return sameDay
+      ? d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+      : d.toLocaleDateString([], { month: "short", day: "numeric" });
+  }
 
   // ── Brain: who answers this conversation ───
   // "cloud" (OpenClaw, relayed by the robot) or "local" (ESP-Claw's agent
@@ -248,6 +309,12 @@
   });
 
   // ── Conversation actions ──────────────────
+  function openVoicePanel(id = null) {
+    voicePanelId = id || (voiceState.id?.startsWith("voice-") ? voiceState.id : latestVoice?.id || null);
+    voiceWakeError = "";
+    showVoicePanel = true;
+  }
+
   function selectConversation(id) {
     const convo = getConversation(id);
     if (!convo) return;
@@ -257,26 +324,45 @@
     messages = convo.messages || [];
     // The conversation's own brain, whatever the toggle said last.
     brain = normalizeBrain(convo.brain);
+    conversationArchived = !!convo.archived;
+    markConversationRead(convo.id);
+    voiceWakeError = "";
+    voiceWakeRequested = false;
     sending = false;
+    if (convo.source === "voice") openVoicePanel(convo.id);
     if (window.innerWidth < 768) showSidebar = false;
     sendSessionReset(sessionId);
   }
 
   /** An empty conversation on the brain the user last chose. */
-  function startFresh() {
-    const newId = makeUUID();
-    sessionId = newId;
+  function startFresh(id = makeUUID(), nextBrain = getPreferredBrain()) {
+    sessionId = id;
     messages = [];
+    conversationArchived = false;
+    voiceWakeError = "";
+    voiceWakeRequested = false;
     sending = false;
-    brain = getPreferredBrain();
+    brain = nextBrain;
     if (brain === BRAINS.LOCAL && !localBrainAvailable) brain = BRAINS.CLOUD;
-    sendSessionReset(newId);
+    sendSessionReset(sessionId);
   }
 
-  function newConversation() {
+  async function newConversation() {
     if (messages.length > 0) saveConversation(sessionId, { messages, brain });
     sidebarRefreshKey++;
-    startFresh();
+    if (brain === BRAINS.LOCAL) {
+      try {
+        const res = await fetch("/v1/voice/history/new", { method: "POST" });
+        if (!res.ok) throw new Error("new voice conversation failed");
+        const data = await res.json();
+        startFresh(data.id, BRAINS.LOCAL);
+      } catch {
+        // MCP-only firmware or unavailable voice still supports local text.
+        startFresh(undefined, BRAINS.LOCAL);
+      }
+    } else {
+      startFresh(undefined, brain);
+    }
     inputEl?.focus();
   }
 
@@ -345,8 +431,9 @@
     socket.onopen = () => {
       if (socket !== ws) return;        // stale socket — ignore
       connected = true;
-      sendSessionReset(sessionId, { pwa_build: "brains-v15" });
+      sendSessionReset(sessionId, { pwa_build: "brains-v20" });
       probeLocalBrain();
+      void loadVoiceHistory();
     };
 
     socket.onclose = () => {
@@ -388,7 +475,57 @@
     return -1;
   }
 
+  async function loadVoiceHistory() {
+    try {
+      /* Fewer conversations keeps the LittleFS read short: the history handler
+       * runs on the httpd task, and a long read stalls every other request. */
+      const res = await fetch("/v1/voice/history?limit=6", { cache: "no-store" });
+      if (!res.ok) return;
+      importVoiceHistory(await res.json());
+      // Refresh an open voice transcript; never steal focus from a text chat.
+      const open = getConversation(sessionId);
+      if (open?.source === "voice" && !sending) {
+        messages = open.messages;
+        brain = BRAINS.LOCAL;
+        conversationArchived = !!open.archived;
+        markConversationRead(sessionId);
+      }
+      sidebarRefreshKey++;
+    } catch {
+      // Older firmware and MCP/server brain have no local history endpoint.
+    }
+  }
+
   function handleMessage(data) {
+    if (data.type === "voice_turn") {
+      const convo = appendVoiceTurn(data, { activeId: sessionId });
+      if (voiceWakeRequested && convo) {
+        /* A wake from a fresh Cloud chat moves to the robot-owned voice
+         * session as soon as its first transcript exists. */
+        voiceWakeRequested = false;
+        selectConversation(convo.id);
+      } else if (convo && data.conversation_id === sessionId) {
+        messages = convo.messages;
+        brain = BRAINS.LOCAL;
+        markConversationRead(sessionId);
+      }
+      sidebarRefreshKey++;
+      return;
+    }
+    if (data.type === "voice_step") {
+      if (data.conversation_id === sessionId && typeof data.text === "string") {
+        messages = [...messages, { role: "step", text: data.text, ts: Date.now() }];
+        saveConversation(sessionId, { messages, brain: BRAINS.LOCAL });
+      }
+      sidebarRefreshKey++;
+      return;
+    }
+    if (data.type === "voice_state") {
+      voiceState = { state: data.state || "idle", id: data.conversation_id || null };
+      sidebarRefreshKey++;
+      return;
+    }
+
     // ── Chunked chat_reply reassembly (array-based like original) ──
     if (data.type === "chat_reply_chunk") {
       const sid = data.session_id;
@@ -533,7 +670,7 @@
         role: "bot",
         text: data.text,
         commands: data.commands || [],
-        ts: data.ts,
+        ts: data.ts || Date.now(),
       };
       if (lastMsg && lastMsg.role === "bot" && lastMsg.text === data.text) {
         messages = [...messages.slice(0, -1), newMsg];
@@ -565,9 +702,105 @@
     }
   }
 
-  // ── Send message ──────────────────────────
+  // ── Send message / wake voice ─────────────
+  async function wakeVoice() {
+    if (voiceWakeBusy || !connected) return;
+    openVoicePanel(voicePanelId);
+    voiceWakeBusy = true;
+    voiceWakeError = "";
+    voiceWakeRequested = true;
+    voiceState = { state: "starting", id: voicePanelId };
+    try {
+      const res = await fetch("/v1/voice", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ wake: true }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || "Voice chat could not start");
+    } catch (error) {
+      voiceWakeRequested = false;
+      voiceState = { state: "idle", id: voicePanelId };
+      voiceWakeError = error?.message || "Voice chat could not start";
+    } finally {
+      voiceWakeBusy = false;
+    }
+  }
+
+  async function endVoiceSession() {
+    if (voiceWakeBusy) return;
+    voiceWakeBusy = true;
+    voiceWakeError = "";
+    try {
+      const res = await fetch("/v1/voice", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ end: true }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || "Could not end voice chat");
+      voiceWakeRequested = false;
+      voiceState = { state: "ended", id: voicePanelId };
+    } catch (error) {
+      voiceWakeError = error?.message || "Could not end voice chat";
+    } finally {
+      voiceWakeBusy = false;
+    }
+  }
+
+  async function newVoiceSession() {
+    if (voiceWakeBusy) return;
+    voiceWakeBusy = true;
+    voiceWakeError = "";
+    try {
+      const res = await fetch("/v1/voice/history/new", { method: "POST" });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.id) throw new Error(data.error || "Could not create a voice session");
+      startFresh(data.id, BRAINS.LOCAL);
+      voicePanelId = data.id;
+      voiceState = { state: "idle", id: data.id };
+      voiceWakeRequested = false;
+      showVoicePanel = true;
+      sidebarRefreshKey++;
+    } catch (error) {
+      voiceWakeError = error?.message || "Could not create a voice session";
+    } finally {
+      voiceWakeBusy = false;
+    }
+  }
+
+  async function clearVoiceContext() {
+    const id = voicePanelId;
+    if (!id || voiceWakeBusy) return;
+    if (!window.confirm("Clear this voice session's context and transcript from the robot and this phone?")) return;
+    voiceWakeBusy = true;
+    voiceWakeError = "";
+    try {
+      const res = await fetch("/v1/voice", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ clear_context: id }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || "Could not clear voice context");
+      clearConversationMessages(id);
+      if (sessionId === id) messages = [];
+      voiceState = { state: "cleared", id };
+      sidebarRefreshKey++;
+    } catch (error) {
+      voiceWakeError = error?.message || "Could not clear voice context";
+    } finally {
+      voiceWakeBusy = false;
+    }
+  }
+
+  function submitChat() {
+    if (voiceWakeMode) wakeVoice();
+    else sendMessage(inputText);
+  }
+
   function sendMessage(text) {
-    if (!text.trim() || sending || !ws || ws.readyState !== WebSocket.OPEN) return;
+    if (!text.trim() || sending || conversationArchived || !ws || ws.readyState !== WebSocket.OPEN) return;
 
     const nowTs = Date.now();
     messages = [...messages, {
@@ -590,18 +823,28 @@
     }));
   }
 
+  function onArchiveChange(event) {
+    if (event.detail?.id === sessionId) {
+      conversationArchived = !!event.detail.archived;
+      sidebarRefreshKey++;
+    }
+  }
+
   // ── Lifecycle ──────────────────────────────
   onMount(() => {
     const convo = getConversation(sessionId);
     if (convo && convo.messages.length > 0) {
       messages = convo.messages;
       brain = normalizeBrain(convo.brain);
+      conversationArchived = !!convo.archived;
     }
     connect();
+    window.addEventListener("mpx-conversation-archive", onArchiveChange);
     // Dev-only: lets you replay server frames from the console, e.g.
     //   __mpxChat.inject({ type: "step", text: "Planning", seq: 1, total: 3 })
     if (import.meta.env.DEV) window.__mpxChat = { inject: handleMessage };
     return () => {
+      window.removeEventListener("mpx-conversation-archive", onArchiveChange);
       disconnect();
       if (import.meta.env.DEV) delete window.__mpxChat;
     };
@@ -768,23 +1011,70 @@
 
     <!-- Input bar -->
     <div class="input-bar">
+      {#if latestVoice || voiceState.state !== "idle"}
+        <button
+          type="button"
+          class="voice-recent"
+          class:live={latestVoiceLive}
+          aria-label={latestVoice ? "Open latest voice conversation" : "Open voice conversation in progress"}
+          title={latestVoice ? `Open voice conversation (${voiceWhen(latestVoice)})` : "Voice conversation in progress"}
+          onclick={() => openVoicePanel(latestVoice?.id || null)}
+        >
+          <span class="voice-recent-icon" aria-hidden="true">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="9" y="3" width="6" height="11" rx="3"/>
+              <path d="M5 11a7 7 0 0 0 14 0M12 18v3"/>
+            </svg>
+          </span>
+          <span class="voice-recent-copy">
+            <span class="voice-recent-heading">
+              <span class="voice-recent-label">
+                {#if latestVoiceLive}<span class="voice-dot" aria-hidden="true"></span>{/if}
+                {latestVoiceLive ? `Voice · ${voiceState.state}` : "Latest voice chat"}
+              </span>
+              <span class="voice-recent-when">{latestVoice ? voiceWhen(latestVoice) : "Now"}</span>
+            </span>
+            <span class="voice-recent-title">{latestVoice ? voiceTitle(latestVoice) : "Listening for your voice…"}</span>
+            {#if latestVoice && voiceReply(latestVoice)}
+              <span class="voice-recent-reply">{voiceReply(latestVoice)}</span>
+            {/if}
+          </span>
+          {#if latestVoice}
+            <svg class="voice-recent-open" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="m9 18 6-6-6-6"/>
+            </svg>
+          {/if}
+        </button>
+      {/if}
+      {#if voiceWakeError && !showVoicePanel}
+        <div class="voice-wake-error" role="alert">{voiceWakeError}</div>
+      {/if}
       <div class="input-row">
         <input
           bind:this={inputEl}
           bind:value={inputText}
-          onkeydown={(e) => e.key === "Enter" && sendMessage(inputText)}
-          placeholder={sending ? "Pupper is working…" : connected ? "Ask Pupper to do something…" : "Pupper is waking up…"}
-          disabled={sending || !connected}
+          oninput={() => voiceWakeError = ""}
+          onkeydown={(e) => e.key === "Enter" && submitChat()}
+          placeholder={conversationArchived ? "Unarchive this conversation to reply" : sending ? "Pupper is working…" : voiceWakeMode ? "Type, or tap the mic to talk…" : connected ? "Ask Pupper to do something…" : "Pupper is waking up…"}
+          disabled={conversationArchived || sending || !connected}
           class="chat-input"
-          enterkeyhint="send"
+          enterkeyhint={voiceWakeMode ? "go" : "send"}
         />
         <button
           class="send-btn"
-          onclick={() => sendMessage(inputText)}
-          disabled={!inputText.trim() || sending || !connected}
+          class:wake-mode={voiceWakeMode}
+          aria-label={voiceWakeMode ? "Start voice chat" : "Send message"}
+          title={voiceWakeMode ? "Start voice chat without the wake word" : "Send message"}
+          onclick={submitChat}
+          disabled={voiceWakeBusy || conversationArchived || sending || !connected || (!voiceWakeMode && !inputText.trim())}
         >
-          {#if sending}
+          {#if sending || voiceWakeBusy}
             <span class="spinner small"></span>
+          {:else if voiceWakeMode}
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <rect x="9" y="3" width="6" height="11" rx="3"/>
+              <path d="M5 11a7 7 0 0 0 14 0M12 18v3"/>
+            </svg>
           {:else}
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
               <line x1="22" y1="2" x2="11" y2="13"/>
@@ -795,9 +1085,114 @@
       </div>
     </div>
   </div>
+
+  {#if showVoicePanel}
+    <VoicePanel
+      conversation={voicePanelConversation}
+      voiceState={voicePanelState}
+      busy={voiceWakeBusy}
+      error={voiceWakeError}
+      onWake={wakeVoice}
+      onEnd={endVoiceSession}
+      onNew={newVoiceSession}
+      onClear={clearVoiceContext}
+      onClose={() => showVoicePanel = false}
+    />
+  {/if}
 </div>
 
 <style>
+  /* The newest voice transcript gets a useful preview, not another chip row.
+   * Every older transcript is still available from the History drawer. */
+  .voice-recent {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    margin: 0 0 9px;
+    padding: 10px 12px;
+    border: 1px solid var(--hair);
+    border-radius: 16px;
+    background: var(--panel, var(--page));
+    color: var(--ink);
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.04);
+  }
+
+  .voice-recent:hover { border-color: var(--sub); }
+  .voice-recent:focus-visible { outline: 3px solid var(--ink); outline-offset: 2px; }
+  .voice-recent:disabled { opacity: 1; cursor: default; }
+  .voice-recent.live { border-color: var(--accent, var(--sub)); }
+
+  .voice-recent-icon {
+    display: grid;
+    place-items: center;
+    width: 36px;
+    height: 36px;
+    border-radius: 12px;
+    background: var(--page);
+    color: var(--sub);
+  }
+
+  .voice-recent.live .voice-recent-icon { color: var(--ink); }
+  .voice-recent-copy { display: block; min-width: 0; }
+
+  .voice-recent-heading {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 3px;
+  }
+
+  .voice-recent-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    min-width: 0;
+    color: var(--sub);
+    font-size: 10px;
+    font-weight: 800;
+    letter-spacing: 0.055em;
+    text-transform: uppercase;
+  }
+
+  .voice-recent-when {
+    flex: 0 0 auto;
+    color: var(--sub);
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .voice-recent-title,
+  .voice-recent-reply {
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .voice-recent-title { font-size: 13px; font-weight: 750; }
+  .voice-recent-reply { margin-top: 2px; color: var(--sub); font-size: 12px; }
+  .voice-recent-open { color: var(--sub); }
+
+  .voice-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: currentColor;
+    flex: 0 0 auto;
+    animation: voice-pulse 1.2s ease-in-out infinite;
+  }
+
+  @keyframes voice-pulse {
+    0%, 100% { opacity: 0.25; }
+    50% { opacity: 1; }
+  }
+
   .chat-root {
     display: flex;
     flex: 1;
@@ -970,6 +1365,14 @@
   }
   .input-row:focus-within { outline: 3px solid var(--ink); outline-offset: 2px; }
 
+  .voice-wake-error {
+    max-width: calc(var(--page-max) - 32px);
+    margin: 0 auto 7px;
+    color: var(--danger, #b3261e);
+    font-size: 12px;
+    font-weight: 650;
+  }
+
   .chat-input {
     flex: 1;
     border: none;
@@ -995,5 +1398,6 @@
     flex-shrink: 0;
   }
   .send-btn:active:not(:disabled) { transform: scale(0.94); }
+  .send-btn.wake-mode { background: var(--mpx-yellow); color: var(--ink); }
   .send-btn:disabled { opacity: 0.35; cursor: default; }
 </style>

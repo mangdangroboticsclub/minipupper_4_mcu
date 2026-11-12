@@ -8,7 +8,10 @@
  *   brain: string,       // "cloud" | "local" -- who answers, fixed for the
  *                        // conversation's life (see BRAINS below)
  *   createdAt: number,   // Date.now()
- *   updatedAt: number,   // Date.now()
+ *   updatedAt: number,   // Date.now() or the robot's last turn timestamp
+ *   source?: "voice",   // robot-owned transcript, imported into this cache
+ *   archived?: boolean,
+ *   unread?: number,
  *   messages: [          // serialisable message objects
  *     { role, text, status?, history?, commands?, ts? }
  *   ]
@@ -117,7 +120,9 @@ export function getConversation(id) {
 /**
  * Persist (create or update) a conversation.
  */
-export function saveConversation(id, { messages, title, brain }) {
+export function saveConversation(id, {
+  messages, title, brain, source, createdAt, updatedAt, archived, unread,
+}) {
   const all = readAll();
   const existing = all[id];
   const now = Date.now();
@@ -127,11 +132,30 @@ export function saveConversation(id, { messages, title, brain }) {
     title: title ?? (messages ? inferTitle(messages) : existing?.title ?? "New Conversation"),
     // Conversations saved before the brain existed were all cloud ones.
     brain: normalizeBrain(brain ?? existing?.brain),
-    createdAt: existing?.createdAt ?? now,
-    updatedAt: now,
+    source: source ?? existing?.source,
+    createdAt: createdAt ?? existing?.createdAt ?? now,
+    updatedAt: updatedAt ?? now,
+    archived: archived ?? existing?.archived ?? false,
+    unread: unread ?? existing?.unread ?? 0,
     messages: messages ?? existing?.messages ?? [],
   };
 
+  writeAll(all);
+  return all[id];
+}
+
+/** Remove displayed turns after the robot has cleared the same session. */
+export function clearConversationMessages(id) {
+  const all = readAll();
+  const existing = all[id];
+  if (!existing) return null;
+  all[id] = {
+    ...existing,
+    title: existing.source === "voice" ? "Voice chat" : "New Conversation",
+    messages: [],
+    unread: 0,
+    updatedAt: Date.now(),
+  };
   writeAll(all);
   return all[id];
 }
@@ -197,6 +221,129 @@ export function importConversations(jsonStr, { onConflict = "overwrite" } = {}) 
 
   writeAll(all);
   return count;
+}
+
+function voiceMessage(message) {
+  if (!message || typeof message.text !== "string") return null;
+  const role = message.role === "assistant" ? "bot" : message.role;
+  if (role !== "user" && role !== "bot" && role !== "step") return null;
+  return {
+    role,
+    text: message.text,
+    ts: Number(message.ts) || 0,
+    ...(message.spoken === undefined ? {} : { spoken: message.spoken }),
+  };
+}
+
+function sameTurn(a, b) {
+  return a && b && a.role === b.role && a.text === b.text &&
+    !!a.ts && !!b.ts && a.ts === b.ts;
+}
+
+/** Append one robot-originated live voice turn without selecting its chat. */
+export function appendVoiceTurn(frame, { activeId = null } = {}) {
+  if (!frame || !/^voice-[0-9a-f]{8}$/.test(frame.conversation_id || "")) return null;
+  const message = voiceMessage({ ...frame, role: frame.role });
+  if (!message || (message.role !== "user" && message.role !== "bot")) return null;
+  const id = frame.conversation_id;
+  const all = readAll();
+  const existing = all[id];
+  const oldMessages = existing?.messages || [];
+  const last = oldMessages[oldMessages.length - 1];
+  // Compatibility with frames from older firmware: merge the authoritative
+  // robot timestamp/spoken flag instead of dropping or duplicating the reply.
+  const exact = oldMessages.findIndex((m) => sameTurn(m, message));
+  const adjacent = last && last.role === message.role && last.text === message.text
+    ? oldMessages.length - 1 : -1;
+  const duplicate = exact >= 0 ? exact : adjacent;
+  if (duplicate >= 0) {
+    const messages = [...oldMessages];
+    messages[duplicate] = {
+      ...messages[duplicate], ...message,
+      ts: message.ts || messages[duplicate].ts,
+    };
+    all[id] = { ...existing, messages };
+    writeAll(all);
+    return all[id];
+  }
+  const now = Date.now();
+  const messages = [...oldMessages, message];
+  const unread = id === activeId ? 0 : (existing?.unread || 0) + 1;
+  all[id] = {
+    id,
+    title: existing?.title || inferTitle(messages),
+    brain: BRAINS.LOCAL,
+    source: "voice",
+    createdAt: existing?.createdAt || message.ts || now,
+    updatedAt: message.ts || now,
+    archived: existing?.archived || false,
+    unread,
+    messages,
+  };
+  writeAll(all);
+  return all[id];
+}
+
+/** Merge robot-owned history into the browser cache. Robot timestamps and ids
+ * are retained; typed messages in the same voice session are not discarded. */
+export function importVoiceHistory(payload) {
+  if (!payload || !Array.isArray(payload.conversations)) return 0;
+  const all = readAll();
+  let count = 0;
+  for (const remote of payload.conversations) {
+    if (!remote || !/^voice-[0-9a-f]{8}$/.test(remote.id || "") ||
+        !Array.isArray(remote.messages)) continue;
+    const existing = all[remote.id];
+    const messages = [...(existing?.messages || [])];
+    for (const raw of remote.messages) {
+      const message = voiceMessage(raw);
+      if (!message) continue;
+      const last = messages[messages.length - 1];
+      const exact = messages.findIndex((m) => sameTurn(m, message));
+      const adjacent = last && last.role === message.role && last.text === message.text
+        ? messages.length - 1 : -1;
+      const duplicate = exact >= 0 ? exact : adjacent;
+      if (duplicate >= 0) {
+        messages[duplicate] = {
+          ...messages[duplicate], ...message,
+          ts: message.ts || messages[duplicate].ts,
+        };
+      } else {
+        messages.push(message);
+      }
+    }
+    messages.sort((a, b) => (a.ts || 0) - (b.ts || 0));
+    const updatedAt = Math.max(existing?.updatedAt || 0, Number(remote.updatedAt) || 0) || Date.now();
+    all[remote.id] = {
+      id: remote.id,
+      title: remote.title || existing?.title || inferTitle(messages),
+      brain: BRAINS.LOCAL,
+      source: "voice",
+      createdAt: existing?.createdAt || Number(remote.createdAt) || Number(messages[0]?.ts) || Date.now(),
+      updatedAt,
+      archived: existing?.archived || false,
+      unread: existing?.unread || 0,
+      messages,
+    };
+    count++;
+  }
+  writeAll(all);
+  return count;
+}
+
+export function setConversationArchived(id, archived) {
+  const all = readAll();
+  if (!all[id]) return null;
+  all[id] = { ...all[id], archived: !!archived };
+  writeAll(all);
+  return all[id];
+}
+
+export function markConversationRead(id) {
+  const all = readAll();
+  if (!all[id]) return;
+  all[id] = { ...all[id], unread: 0 };
+  writeAll(all);
 }
 
 export { generateUUID };

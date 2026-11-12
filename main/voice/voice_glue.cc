@@ -41,6 +41,7 @@ bool voice_wanted()
 #include "mpx_robot.h"
 #include "mpx_voice_link.h"
 #include "mpx_voice_wake.h"
+#include "voice_brain.h"
 #include "voice_tools.h"
 
 #if CONFIG_APP_DISPLAY_ENABLE
@@ -72,6 +73,19 @@ int          s_task_priority = 5;  /* wake_feed/wake_fetch, see set_task_priorit
 bool hands_free_wanted()
 {
     return voice_glue::voice_wanted() && s_wake_ready;
+}
+
+esp_err_t configure_brain()
+{
+    if (voice_brain::wanted()) {
+        const esp_err_t err = voice_brain::start();
+        if (err == ESP_OK) return ESP_OK;
+        ESP_LOGW(TAG, "local voice brain unavailable (%s); using the gateway's MCP brain",
+                 esp_err_to_name(err));
+    } else {
+        voice_brain::stop();
+    }
+    return voice_tools::start();
 }
 
 esp_err_t hands_free_start_locked()
@@ -141,6 +155,7 @@ esp_err_t apply_mode()
     ESP_LOGW(TAG, "AI mode -> %s", agent_config::mode_name(agent_config::mode()));
     if (!s_started) return ESP_OK;
     if (!voice_wanted()) {
+        voice_brain::stop();
         if (cap_music_active()) cap_music_stop();
         mpx_voice_wake_auto_stop();
         mpx_voice_disconnect();
@@ -152,6 +167,9 @@ esp_err_t apply_mode()
         return ESP_OK;
     }
     if (!available()) return ESP_ERR_NOT_SUPPORTED;
+    if (configure_brain() != ESP_OK) {
+        ESP_LOGW(TAG, "voice brain did not start");
+    }
     /* Off -> on: the front end was never built if the robot booted with
      * voice off, so this goes through the init-if-needed path. While a skill
      * holds voice this defers (hands_free_start()/locked) and the release
@@ -200,15 +218,15 @@ void start()
      * first start already uses the caller's choice. */
     mpx_voice_wake_set_task_priority(s_task_priority);
 
-    /* The tool bridge, so the server's model can move the robot. Nothing
-     * network-related happens until a session opens. */
-    if (voice_tools::start() != ESP_OK) {
-        ESP_LOGW(TAG, "voice tools did not start -- the server cannot move the robot");
-    }
-
     if (!voice_wanted()) {
         ESP_LOGW(TAG, "AI is off: voice disabled, the microphone stays closed");
         return;
+    }
+
+    /* Device brain: ESP-Claw answers and the gateway is STT/TTS. Server
+     * brain: the gateway's model answers through the MCP tool bridge. */
+    if (configure_brain() != ESP_OK) {
+        ESP_LOGW(TAG, "voice brain did not start -- voice turns cannot use tools");
     }
 
     /* Load esp-sr's models and build the AFE now, at boot, rather than on
@@ -262,6 +280,13 @@ void hands_free_stop()
     mpx_voice_wake_auto_stop();
 }
 
+esp_err_t wake_now()
+{
+    const esp_err_t err = hands_free_start();
+    if (err != ESP_OK) return err;
+    return mpx_voice_wake_trigger();
+}
+
 esp_err_t hold(const char *why)
 {
     const char *reason = (why && why[0]) ? why : "skill";
@@ -283,7 +308,12 @@ esp_err_t hold(const char *why)
     if (mpx_voice_stream_is_playing()) {
         mpx_voice_stream_abort_playback();
     }
-    mpx_voice_disconnect();
+    /* A device-brain skill must leave the control socket up: the agent's
+     * final reply is sent back through it after mpx_run_skill returns. Pi
+     * takeover and server-brain holds keep the old full disconnect. */
+    if (!(mpx_voice_device_brain() && strcmp(reason, "skill") == 0)) {
+        mpx_voice_disconnect();
+    }
 
     /* The speaker is shared: music waiting for it would take it from the
      * skill (or from whatever the skill plays). */
@@ -429,6 +459,7 @@ void start() { ESP_LOGI(TAG, "voice not compiled in (CONFIG_APP_VOICE_ENABLE=n)"
 void on_master_changed(bool) {}
 esp_err_t hands_free_start() { return ESP_ERR_NOT_SUPPORTED; }
 void hands_free_stop() {}
+esp_err_t wake_now() { return ESP_ERR_NOT_SUPPORTED; }
 esp_err_t provision() { return ESP_ERR_NOT_SUPPORTED; }
 esp_err_t hold(const char *) { return ESP_OK; }
 void release(const char *) {}

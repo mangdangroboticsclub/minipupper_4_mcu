@@ -105,6 +105,13 @@ CONFIG_VFS_MAX_COUNT=12
 # Stage verbosity VERBOSE: the "Round N: tool(...)" notes become the step
 # lines in the PWA's activity panel. Subagents capped at 2 (each is another
 # agent core with a 16 KB stack).
+# The system monitor walks xTasksWaitingTermination with
+# uxTaskGetSystemState(), and ESP-IDF's vTaskDeleteWithCaps() frees the TCB
+# before the idle task unlinks it -- so the next sample dereferences freed
+# memory and panics (LoadProhibited in vTaskGetInfo). This firmware deletes
+# WithCaps tasks on every skill run, voice loopback and wake-word teardown.
+# Off until those workers are made persistent; see main/Kconfig.projbuild.
+# CONFIG_APP_SYSMON_ENABLE is not set
 CONFIG_APP_CLAW_ENABLE_CLI=n
 CONFIG_APP_CLAW_CAP_LUA=n
 # The Lua drivers and modules are separate symbols that do NOT depend on

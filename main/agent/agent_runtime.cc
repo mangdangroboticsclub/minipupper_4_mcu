@@ -4,6 +4,7 @@
 
 #if CONFIG_APP_AGENT_ENABLE
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -16,6 +17,7 @@
 #include "agent/agent_fs.h"
 #include "app_claw.h"
 #include "cap_im_local.h"
+#include "claw_memory.h"
 
 static const char *TAG = "agent";
 
@@ -41,6 +43,7 @@ constexpr const char *kGatewayTokField = "max_tokens";
 
 bool s_running = false;
 agent::OutboundFn s_outbound = nullptr;
+std::atomic<agent::OutboundListenerFn> s_outbound_listener{nullptr};
 
 void copy_field(char *dst, size_t dst_size, const char *src)
 {
@@ -151,6 +154,14 @@ esp_err_t on_outbound(const cap_im_local_message_t *msg, void *)
 			text++;
 		}
 	}
+	/* The voice listener only queues, so a slow PWA socket cannot delay speech.
+	 * A consumed voice reply has voice_turn/voice_step as its single PWA path;
+	 * also sending generic chat_reply/step would duplicate every live turn. */
+	const agent::OutboundListenerFn listener =
+		s_outbound_listener.load(std::memory_order_acquire);
+	if (listener && listener(msg->chat_id, text, is_step)) {
+		return ESP_OK;
+	}
 	if (s_outbound) {
 		s_outbound(msg->chat_id, text, is_step);
 	} else {
@@ -241,9 +252,43 @@ esp_err_t submit(const char *session_id, const char *text)
 	return cap_im_local_emit_user_message(kChannel, session_id, kSenderId, nullptr, text, nullptr, 0);
 }
 
+esp_err_t submit_voice(const char *session_id, const char *text)
+{
+	if (!text) return ESP_ERR_INVALID_ARG;
+	/* Voice normally needs one direct response, not a visible agent loop.
+	 * Keep physical-action tools available, but make them the exception.
+	 * The end marker is consumed by voice_brain and is never spoken. */
+	static constexpr char kVoicePrompt[] =
+		"[Voice mode: answer immediately in one short natural spoken reply. "
+		"Do not use tools or multi-step reasoning unless the user explicitly "
+		"requests a physical robot action. Never narrate your thinking or say "
+		"'one moment'. If the user clearly wants to leave or end this voice "
+		"conversation, append [[END_VOICE]].]\nUser said: ";
+	const size_t size = strlen(text) + sizeof(kVoicePrompt);
+	char *prompt = static_cast<char *>(malloc(size));
+	if (!prompt) return ESP_ERR_NO_MEM;
+	snprintf(prompt, size, "%s%s", kVoicePrompt, text);
+	const esp_err_t err = submit(session_id, prompt);
+	free(prompt);
+	return err;
+}
+
+esp_err_t clear_session(const char *session_id)
+{
+	if (!session_id || !session_id[0]) return ESP_ERR_INVALID_ARG;
+	if (!s_running) return ESP_ERR_INVALID_STATE;
+	bool deleted = false;
+	return claw_memory_delete_session_history(session_id, &deleted);
+}
+
 void set_outbound(OutboundFn fn)
 {
 	s_outbound = fn;
+}
+
+void set_outbound_listener(OutboundListenerFn fn)
+{
+	s_outbound_listener.store(fn, std::memory_order_release);
 }
 
 }  // namespace agent
@@ -257,7 +302,10 @@ bool running() { return false; }
 esp_err_t start() { return ESP_ERR_NOT_SUPPORTED; }
 esp_err_t apply_config() { return ESP_ERR_NOT_SUPPORTED; }
 esp_err_t submit(const char *, const char *) { return ESP_ERR_INVALID_STATE; }
+esp_err_t submit_voice(const char *, const char *) { return ESP_ERR_INVALID_STATE; }
+esp_err_t clear_session(const char *) { return ESP_ERR_INVALID_STATE; }
 void set_outbound(OutboundFn) {}
+void set_outbound_listener(OutboundListenerFn) {}
 
 }  // namespace agent
 

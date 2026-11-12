@@ -17,6 +17,10 @@
 
   let stats = $state(null);
   let error = $state("");
+  /* The firmware can be built without the monitor (CONFIG_APP_SYSMON_ENABLE
+   * off); it then answers {"ok":false,"error":"system monitor disabled"}.
+   * Hide the gauge rather than show a permanently empty ring. */
+  let disabled = $state(false);
   let open = $state(false);
   let updatedAt = $state(0);
   let timer = null;
@@ -35,6 +39,7 @@
           updatedAt = Date.now();
         } else {
           error = data.error || "unavailable";
+          if (data.error === "system monitor disabled") disabled = true;
         }
       } catch {
         error = "unreachable";
@@ -96,7 +101,8 @@
 
 <svelte:window onkeydown={onKey} />
 
-<button type="button" class="gauge" class:stale={!online || (error && !stats)} onclick={toggle}
+{#if !disabled}
+  <button type="button" class="gauge" class:stale={!online || (error && !stats)} onclick={toggle}
         aria-haspopup="dialog" aria-expanded={open} aria-label={label}>
   <svg width="40" height="40" viewBox="0 0 40 40" aria-hidden="true">
     <circle class="track" cx="20" cy="20" r={R_OUT} />
@@ -106,6 +112,7 @@
   </svg>
   <span class="num">{cpuMax ?? "–"}</span>
 </button>
+{/if}
 
 {#if open}
   <div class="scrim" role="presentation" onclick={() => (open = false)}></div>

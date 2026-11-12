@@ -400,13 +400,29 @@ endif  # APP_LUA_ENABLE
 
 config APP_SYSMON_ENABLE
     bool "System monitor (CPU, RAM and task load)"
-    default y
+    default n
     select FREERTOS_GENERATE_RUN_TIME_STATS
     help
         A low-priority task (main/util/sys_monitor.cc) samples per-core
         CPU load, internal RAM, PSRAM and the busiest tasks. The latest
         sample is served at GET /v1/system/stats (the PWA's monitor
         widget) and a summary is printed to the serial log.
+
+        OFF BY DEFAULT: it panics the robot. The sample calls
+        uxTaskGetSystemState(), which walks xTasksWaitingTermination --
+        the list of tasks deleted but not yet reaped by the idle task.
+        ESP-IDF's vTaskDeleteWithCaps() frees the TCB immediately after
+        vTaskDelete() (freertos/esp_additions/idf_additions.c), so that
+        list holds a dangling pointer until idle next runs, and the next
+        sample dereferences freed memory while reading pcTaskName:
+
+          LoadProhibited in vTaskGetInfo <- uxTaskGetSystemState
+          <- monitor_task (main/util/sys_monitor.cc sample_once)
+
+        This firmware deletes WithCaps tasks whenever a skill runs, a
+        voice loopback runs, or the wake word / audio stream tears down,
+        so the window is open often. Re-enable only after those tasks are
+        made persistent (created once and suspended) instead of deleted.
 
         Turns on FreeRTOS run-time stats, which costs one timer read per
         context switch.
@@ -647,6 +663,25 @@ config APP_VOICE_OTA_URL
         identity here on the first wake word and gets back the WebSocket
         URL and token to talk to (saved in NVS). The same host serves the
         marketplace proxy and the chat ingress (APP_CHAT_SERVER_IP).
+
+config APP_VOICE_BRAIN_LOCAL
+    bool "Answer voice with the on-device agent (gateway = STT + TTS)"
+    default y
+    depends on APP_AGENT_ENABLE
+    help
+        Advertise hello features.brain="device": the gateway transcribes and
+        speaks, while ESP-Claw answers with its own tools and conversation
+        memory. Off keeps the server's model and the MCP tool bridge.
+
+config APP_VOICE_CONV_IDLE_HOURS
+    int "Roll the voice conversation after this many idle hours"
+    range 1 168
+    default 12
+    depends on APP_VOICE_ENABLE
+    help
+        Voice turns share one ESP-Claw session so follow-up questions keep
+        their context across wake words and reconnects. After this long
+        without a turn, the next utterance starts a fresh session.
 
 config APP_VOICE_AUTO_LISTEN
     bool "Listen for the wake word from boot (hands-free)"

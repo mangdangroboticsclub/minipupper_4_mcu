@@ -1409,6 +1409,12 @@ static void upstream_task(void *arg)
  *  Public API
  * ═══════════════════════════════════════════════════════════════ */
 
+/* Voice turns are not tied to the text session currently open in a phone. */
+void broadcast_voice_to_pwa(const char *json_text)
+{
+    if (json_text) broadcast_to_pwa(nullptr, json_text);
+}
+
 bool init_chat_pipeline()
 {
     // Bind the local agent before allocating any optional chat-pipeline
@@ -1502,6 +1508,24 @@ bool init_chat_pipeline()
     }
 
     return true;
+}
+
+/* True while this fd is a registered PWA chat socket. The HTTP server's
+ * orphan reaper uses this so a slow LittleFS read on the httpd task can
+ * never make it close a phone connection that is still alive. */
+bool chat_ws_owns_fd(int fd)
+{
+    if (!s_pwa_mutex || fd < 0) return false;
+    bool owned = false;
+    xSemaphoreTake(s_pwa_mutex, portMAX_DELAY);
+    for (size_t i = 0; i < MAX_PWA_WS_CLIENTS; ++i) {
+        if (s_pwa_clients[i].fd == fd) {
+            owned = true;
+            break;
+        }
+    }
+    xSemaphoreGive(s_pwa_mutex);
+    return owned;
 }
 
 void pwa_release_fd(httpd_handle_t hd, int sockfd)

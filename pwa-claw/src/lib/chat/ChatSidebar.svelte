@@ -1,5 +1,5 @@
 <script>
-  import { listConversations } from "../conversationStore.js";
+  import { deleteConversation, listConversations, setConversationArchived } from "../conversationStore.js";
 
   let {
     activeId,
@@ -11,6 +11,7 @@
 
   let conversations = $state([]);
   let searchText = $state("");
+  let showArchived = $state(false);
 
   function refresh() {
     conversations = listConversations();
@@ -37,11 +38,12 @@
 
   /** Group conversations by category */
   let grouped = $derived.by(() => {
+    const visible = conversations.filter((c) => !c.archived);
     const list = searchText.trim()
-      ? conversations.filter((c) =>
+      ? visible.filter((c) =>
           c.title.toLowerCase().includes(searchText.toLowerCase())
         )
-      : conversations;
+      : visible;
 
     const groups = {};
     for (const c of list) {
@@ -52,15 +54,64 @@
     return groups;
   });
 
-  function handleDelete(id, e) {
+  let archived = $derived(conversations.filter((c) => c.archived &&
+    (!searchText.trim() || c.title.toLowerCase().includes(searchText.toLowerCase()))));
+
+  function handleArchive(convo, e) {
     e.stopPropagation();
-    import("../conversationStore.js").then(({ deleteConversation }) => {
-      deleteConversation(id);
-      refresh();
-      if (activeId === id) onDelete?.(id);
-    });
+    const next = !convo.archived;
+    setConversationArchived(convo.id, next);
+    window.dispatchEvent(new CustomEvent("mpx-conversation-archive", {
+      detail: { id: convo.id, archived: next },
+    }));
+    refresh();
+  }
+
+  function handleDelete(convo, e) {
+    e.stopPropagation();
+    if (convo.source === "voice" && !window.confirm(
+      "Remove this voice chat from this phone? The robot transcript and agent memory stay."
+    )) return;
+    deleteConversation(convo.id);
+    refresh();
+    if (activeId === convo.id) onDelete?.(convo.id);
   }
 </script>
+
+{#snippet conversationRow(convo)}
+  <button
+    class="convo-item"
+    class:active={convo.id === activeId}
+    onclick={() => onSelect?.(convo.id)}
+  >
+    <div class="convo-content">
+      <p class="convo-title">
+        <span class="brain-badge" class:local={convo.brain === "local"} title={convo.source === "voice" ? "Voice chat answered by Pupper" : convo.brain === "local" ? "Answered by Pupper (on the robot)" : "Answered by the Cloud"}>
+          {convo.source === "voice" ? "Voice" : convo.brain === "local" ? "Pupper" : "Cloud"}
+        </span>
+        {convo.title}
+        {#if convo.unread}<span class="unread-badge" aria-label="{convo.unread} unread turns">{convo.unread}</span>{/if}
+      </p>
+      {#if convo.messages?.length}
+        <p class="convo-preview">{convo.messages[convo.messages.length - 1]?.text?.slice(0, 80)}</p>
+      {/if}
+    </div>
+    <div class="convo-meta">
+      <span class="convo-time">{formatTime(convo.updatedAt)}</span>
+      <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+      <span class="delete-btn" onclick={(e) => handleArchive(convo, e)} aria-label={convo.archived ? "Unarchive" : "Archive"} title={convo.archived ? "Unarchive" : "Archive"}>
+        {convo.archived ? "↥" : "↓"}
+      </span>
+      <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+      <span class="delete-btn" onclick={(e) => handleDelete(convo, e)} aria-label="Delete">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="18" y1="6" x2="6" y2="18"/>
+          <line x1="6" y1="6" x2="18" y2="18"/>
+        </svg>
+      </span>
+    </div>
+  </button>
+{/snippet}
 
 <div class="sidebar">
   <!-- Header -->
@@ -96,40 +147,20 @@
         <div class="group">
           <span class="group-label">{label}</span>
           {#each convos as convo (convo.id)}
-            <button
-              class="convo-item"
-              class:active={convo.id === activeId}
-              onclick={() => onSelect?.(convo.id)}
-            >
-              <div class="convo-content">
-                <p class="convo-title">
-                  <span class="brain-badge" class:local={convo.brain === "local"} title={convo.brain === "local" ? "Answered by Pupper (on the robot)" : "Answered by the Cloud"}>
-                    {convo.brain === "local" ? "Pupper" : "Cloud"}
-                  </span>
-                  {convo.title}
-                </p>
-                {#if convo.messages?.length}
-                  <p class="convo-preview">{convo.messages[convo.messages.length - 1]?.text?.slice(0, 80)}</p>
-                {/if}
-              </div>
-              <div class="convo-meta">
-                <span class="convo-time">{formatTime(convo.updatedAt)}</span>
-                <!-- svelte-ignore a11y_click_events_have_key_events -->
-                <span
-                  class="delete-btn"
-                  onclick={(e) => handleDelete(convo.id, e)}
-                  aria-label="Delete"
-                >
-                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-                    <line x1="18" y1="6" x2="6" y2="18"/>
-                    <line x1="6" y1="6" x2="18" y2="18"/>
-                  </svg>
-                </span>
-              </div>
-            </button>
+            {@render conversationRow(convo)}
           {/each}
         </div>
       {/each}
+    {/if}
+    {#if archived.length}
+      <button class="archive-toggle" type="button" aria-expanded={showArchived} onclick={() => (showArchived = !showArchived)}>
+        Archived ({archived.length}) {showArchived ? "▾" : "▸"}
+      </button>
+      {#if showArchived}
+        {#each archived as convo (convo.id)}
+          {@render conversationRow(convo)}
+        {/each}
+      {/if}
     {/if}
   </div>
 </div>
@@ -214,6 +245,29 @@
     flex: 1;
     overflow-y: auto;
     padding: 0 10px calc(16px + var(--safe-bottom));
+  }
+
+  .archive-toggle {
+    width: 100%;
+    padding: 14px 10px 8px;
+    border: 0;
+    background: none;
+    color: var(--sub);
+    text-align: left;
+    font-size: 12px;
+    font-weight: 800;
+    cursor: pointer;
+  }
+  .unread-badge {
+    display: inline-grid;
+    place-items: center;
+    min-width: 18px;
+    height: 18px;
+    margin-left: 4px;
+    border-radius: 9px;
+    background: var(--mpx-yellow);
+    color: var(--ink);
+    font-size: 10px;
   }
 
   .group {

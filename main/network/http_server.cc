@@ -3014,6 +3014,7 @@ static void socket_reaper_task(void *)
                 }
             }
             if (!need) { orphan_seen[k] = 0; continue; }
+            if (orphan_seen[k] && network::chat_ws_owns_fd(fd)) { orphan_seen[k] = 0; continue; }
             if (++orphan_seen[k] >= need) {
                 close(fd);
                 orphan_seen[k] = 0;

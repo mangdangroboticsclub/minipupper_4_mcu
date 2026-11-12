@@ -20,18 +20,23 @@
  * The mode is agent_config's; a change is saved, then applied live to the
  * voice stack (voice_glue::apply_mode) and the agent (agent::apply_config)
  * -- there is no restart, unlike mpv2-claw. In "own" the agent uses the
- * owner's LLM while voice still goes to the MangDang gateway.
+ * owner's LLM; device-brain voice still uses the gateway for STT and TTS.
  *
  * /v1/voice -- the voice link itself, for the app and for bench checks in
  * place of mpv2-claw's `voice`, `wake` and `music` console commands:
  *
  *   GET  /v1/voice        status (voice_glue::status_json)
  *   POST /v1/voice        any of: {"volume":0..100} {"hands_free":bool}
- *                         {"provision":true} {"music":"jazz"|"https://..."|"stop"}
+ *                         {"wake":true} {"provision":true}
+ *                         {"music":"jazz"|"https://..."|"stop"}
  *                         {"music_level":5..100}  ->  status
  *   GET  /v1/voice/tools  the tools offered to the voice server
  *   POST /v1/voice/tools  {"name":"robot_move","arguments":{...}} -> the
  *                         tool's reply, as the server would get it
+ *   GET  /v1/voice/history?limit=16
+ *   POST /v1/voice/history/new | /v1/voice/history/clear
+ *                         device-owned voice transcripts; clear never erases
+ *                         ESP-Claw's session memory
  */
 
 #include "network/http_voice.h"
@@ -50,6 +55,9 @@
 #if CONFIG_APP_VOICE_ENABLE
 #include "audio/mpx_audio.h"
 #include "voice/cap_music.h"
+#include "voice/mpx_voice_link.h"
+#include "voice/voice_brain.h"
+#include "voice/voice_history.h"
 #include "voice/voice_tools.h"
 #endif
 
@@ -337,6 +345,38 @@ esp_err_t voice_post_handler(httpd_req_t *req)
         }
     }
 
+    const cJSON *wake = cJSON_GetObjectItem(body, "wake");
+    if (!problem && cJSON_IsTrue(wake)) {
+        const esp_err_t err = voice_glue::wake_now();
+        if (err != ESP_OK) {
+            problem = "voice chat could not start -- check AI & Voice settings";
+            ESP_LOGW(TAG, "software wake: %s", esp_err_to_name(err));
+        }
+    }
+
+    const cJSON *end = cJSON_GetObjectItem(body, "end");
+    if (!problem && cJSON_IsTrue(end)) {
+#if defined(CONFIG_APP_VOICE_BRAIN_LOCAL) && CONFIG_APP_VOICE_BRAIN_LOCAL
+        const esp_err_t err = voice_brain::end_conversation();
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) problem = "could not end voice chat";
+#else
+        mpx_voice_stream_abort_playback();
+        (void)mpx_voice_talk_stop();
+        mpx_voice_disconnect();
+#endif
+    }
+
+    const cJSON *clear_context = cJSON_GetObjectItem(body, "clear_context");
+    if (!problem && cJSON_IsString(clear_context)) {
+        const esp_err_t err = voice_brain::clear_conversation(clear_context->valuestring);
+        if (err == ESP_ERR_INVALID_STATE) {
+            problem = "wait for the current voice answer before clearing its context";
+        } else if (err != ESP_OK) {
+            problem = "could not clear voice context";
+            ESP_LOGW(TAG, "clear voice context: %s", esp_err_to_name(err));
+        }
+    }
+
     const cJSON *hands_free = cJSON_GetObjectItem(body, "hands_free");
     if (!problem && cJSON_IsBool(hands_free)) {
         if (cJSON_IsTrue(hands_free)) {
@@ -421,6 +461,47 @@ esp_err_t tools_post_handler(httpd_req_t *req)
     return send_json(req, root);
 }
 
+esp_err_t history_get_handler(httpd_req_t *req)
+{
+    int limit = 16;
+    char query[32];
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        char value[8];
+        if (httpd_query_key_value(query, "limit", value, sizeof(value)) == ESP_OK) {
+            limit = atoi(value);
+        }
+    }
+    cJSON *root = voice_history::list_json(limit);
+    if (!root) return httpd_resp_send_500(req);
+    char id[24];
+    voice_brain::conversation_id(id, sizeof(id));
+    cJSON_AddStringToObject(root, "active", id);
+    return send_json(req, root);
+}
+
+esp_err_t history_new_handler(httpd_req_t *req)
+{
+    const esp_err_t err = voice_brain::new_conversation();
+    if (err != ESP_OK) {
+        return send_error(req, "409 Conflict", "local voice brain is not running");
+    }
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return httpd_resp_send_500(req);
+    char id[24];
+    voice_brain::conversation_id(id, sizeof(id));
+    cJSON_AddStringToObject(root, "id", id);
+    return send_json(req, root);
+}
+
+esp_err_t history_clear_handler(httpd_req_t *req)
+{
+    const esp_err_t err = voice_history::clear();
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return httpd_resp_send_500(req);
+    cJSON_AddBoolToObject(root, "ok", err == ESP_OK);
+    return send_json(req, root);
+}
+
 #endif  /* CONFIG_APP_VOICE_ENABLE */
 
 }  // namespace
@@ -437,6 +518,9 @@ int network::register_voice_routes(httpd_handle_t server,
         { "/v1/voice",       HTTP_POST, "POST", voice_post_handler },
         { "/v1/voice/tools", HTTP_GET,  "GET",  tools_get_handler  },
         { "/v1/voice/tools", HTTP_POST, "POST", tools_post_handler },
+        { "/v1/voice/history", HTTP_GET, "GET", history_get_handler },
+        { "/v1/voice/history/new", HTTP_POST, "POST", history_new_handler },
+        { "/v1/voice/history/clear", HTTP_POST, "POST", history_clear_handler },
 #endif
     };
     int ok = 0;
