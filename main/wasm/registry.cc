@@ -1,11 +1,15 @@
 #include "wasm/registry.h"
 
+#include <algorithm>
+#include <cstdlib>
 #include <cstring>
+#include <mutex>
 
 #include "esp_log.h"
 #include "cJSON.h"
 
 #include "fs/littlefs_manager.h"
+#include "wasm/wasm_decrypt.h"
 
 static const char *TAG = "registry";
 
@@ -13,6 +17,8 @@ namespace skills {
 namespace {
 
 std::vector<Entry> s_entries;
+std::mutex s_mutex;
+std::mutex s_rescan_mutex;
 
 /* ── WebAssembly section walking ──────────────────────────────────────────
  *
@@ -42,6 +48,19 @@ bool read_leb128(const uint8_t *buf, std::size_t len, std::size_t &i,
         if (shift > 28) return false;      // > 32 bits: malformed
     }
     return false;
+}
+
+bool valid_module(const uint8_t *wasm, std::size_t len)
+{
+    if (len < 8 || std::memcmp(wasm, "\0asm\1\0\0\0", 8) != 0) return false;
+    std::size_t i = 8;
+    while (i < len) {
+        ++i;  // section id; WAMR validates its semantics when executing
+        std::uint32_t size = 0;
+        if (!read_leb128(wasm, len, i, size) || size > len - i) return false;
+        i += size;
+    }
+    return true;
 }
 
 bool find_mpx_section(const uint8_t *wasm, std::size_t len,
@@ -123,36 +142,79 @@ bool parse_module(const uint8_t *wasm, std::size_t len, Entry &out)
     return true;
 }
 
+static void secure_erase_and_free(uint8_t *data, std::size_t size)
+{
+    if (!data) return;
+    volatile uint8_t *p = data;
+    for (std::size_t i = 0; i < size; ++i) p[i] = 0;
+    std::free(data);
+}
+
 void rescan()
 {
-    s_entries.clear();
+    // A slow decrypt from an older scan must never overwrite a newer install.
+    std::lock_guard<std::mutex> rescan_lock(s_rescan_mutex);
+    std::vector<Entry> next;
+    auto names = fs::list_files("/");
+    std::sort(names.begin(), names.end());
 
     // fs::list_files returns full paths ("/foo.wasm"); the www tree is
     // skipped because nothing in it is a skill and reading it all is slow.
-    for (const std::string &name : fs::list_files("/")) {
+    for (const std::string &name : names) {
         if (!is_skill_file(name)) continue;
         if (name.compare(0, 5, "/www/") == 0) continue;
 
         const std::string path = (name[0] == '/') ? name : "/" + name;
         auto bytes = fs::read_file(path.c_str());
-        if (bytes.empty()) continue;
 
         Entry e;
         e.file = path;
-        if (!parse_module(bytes.data(), bytes.size(), e)) {
-            // A skill with no embedded manifest is perfectly valid -- it just
-            // cannot register a gait or a trigger. Built before this existed,
-            // or built by a toolchain that does not add the section.
+        e.slug = path.substr(1, path.size() - 6);
+        if (bytes.empty()) {
+            e.valid = false;
+            e.error = "skill is empty or unreadable";
+            next.push_back(std::move(e));
             continue;
         }
-        if (e.slug.empty()) {
-            e.slug = path.substr(1, path.size() - 6);
+
+        if (path.compare(path.size() - 5, 5, ".mpxe") == 0) {
+            uint8_t *plain = nullptr;
+            std::size_t plain_size = 0;
+            const auto result = wasm::decrypt_mpxe(bytes.data(), bytes.size(),
+                                                   &plain, &plain_size);
+            if (result == wasm::DecryptResult::Success) {
+                if (valid_module(plain, plain_size)) {
+                    // A valid module without a manifest is still runnable.
+                    parse_module(plain, plain_size, e);
+                } else {
+                    e.valid = false;
+                    e.error = "decrypted payload is not valid WebAssembly";
+                }
+            } else {
+                e.valid = false;
+                e.error = "encrypted skill failed authentication";
+                ESP_LOGW(TAG, "Cannot index '%s': decrypt result=%d",
+                         path.c_str(), static_cast<int>(result));
+            }
+            secure_erase_and_free(plain, plain_size);
+        } else if (!valid_module(bytes.data(), bytes.size())) {
+            e.valid = false;
+            e.error = "invalid WebAssembly module";
+        } else {
+            // A plaintext module without a manifest is still runnable.
+            parse_module(bytes.data(), bytes.size(), e);
         }
-        s_entries.push_back(std::move(e));
+        if (e.slug.empty()) e.slug = path.substr(1, path.size() - 6);
+        next.push_back(std::move(e));
     }
 
-    ESP_LOGI(TAG, "%d skill(s) with embedded metadata", (int)s_entries.size());
-    for (const Entry &e : s_entries) {
+    {
+        std::lock_guard<std::mutex> lock(s_mutex);
+        s_entries.swap(next);
+    }
+    const auto snapshot = all();
+    ESP_LOGI(TAG, "%d skill(s) installed", (int)snapshot.size());
+    for (const Entry &e : snapshot) {
         ESP_LOGI(TAG, "  %-20s gait=%-12s autorun=%d behaviour=%d events=%d",
                  e.slug.c_str(),
                  e.provides_gait.empty() ? "-" : e.provides_gait.c_str(),
@@ -160,70 +222,99 @@ void rescan()
     }
 }
 
-const std::vector<Entry> &all() { return s_entries; }
-
-const Entry *by_gait(const char *gait_name)
+std::vector<Entry> all()
 {
-    if (!gait_name || !*gait_name) return nullptr;
-    for (const Entry &e : s_entries)
-        if (!e.provides_gait.empty() && e.provides_gait == gait_name) return &e;
-    return nullptr;
+    std::lock_guard<std::mutex> lock(s_mutex);
+    return s_entries;
 }
 
-const Entry *by_slug(const char *slug)
+std::optional<Entry> by_gait(const char *gait_name)
 {
-    if (!slug || !*slug) return nullptr;
-    for (const Entry &e : s_entries)
-        if (e.slug == slug) return &e;
-    return nullptr;
+    if (!gait_name || !*gait_name) return std::nullopt;
+    std::lock_guard<std::mutex> lock(s_mutex);
+    std::optional<Entry> found;
+    for (const Entry &e : s_entries) {
+        if (!e.valid || e.provides_gait.empty() || e.provides_gait != gait_name) continue;
+        if (found) return std::nullopt;
+        found = e;
+    }
+    return found;
 }
 
-std::vector<const Entry *> by_event(const char *event)
+std::optional<Entry> by_slug(const char *slug)
 {
-    std::vector<const Entry *> out;
+    if (!slug || !*slug) return std::nullopt;
+    std::lock_guard<std::mutex> lock(s_mutex);
+    std::optional<Entry> found;
+    for (const Entry &e : s_entries) {
+        if (!e.valid || e.slug != slug) continue;
+        if (found) return std::nullopt;
+        found = e;
+    }
+    return found;
+}
+
+std::optional<Entry> by_file(const char *path)
+{
+    if (!path || !*path) return std::nullopt;
+    std::lock_guard<std::mutex> lock(s_mutex);
+    for (const Entry &e : s_entries) if (e.file == path) return e;
+    return std::nullopt;
+}
+
+std::vector<Entry> by_event(const char *event)
+{
+    std::vector<Entry> out;
     if (!event || !*event) return out;
-    for (const Entry &e : s_entries)
+    for (const Entry &e : all()) {
+        if (!e.valid) continue;
         for (const std::string &ev : e.on)
-            if (ev == event) { out.push_back(&e); break; }
+            if (ev == event) { out.push_back(e); break; }
+    }
     return out;
 }
 
-const Entry *autorun_entry()
+std::optional<Entry> autorun_entry()
 {
-    const Entry *found = nullptr;
-    for (const Entry &e : s_entries) {
-        if (!e.autorun) continue;
+    std::optional<Entry> found;
+    for (const Entry &e : all()) {
+        if (!e.valid || !e.autorun) continue;
         if (found) {
             ESP_LOGW(TAG, "'%s' also claims autorun; ignoring (autorun is one "
                           "slot, not a queue) -- '%s' has it",
                      e.slug.c_str(), found->slug.c_str());
             continue;
         }
-        found = &e;
+        found = e;
     }
     return found;
 }
 
 std::string to_json()
 {
-    std::string out = "{\"skills\":[";
-    bool first = true;
-    for (const Entry &e : s_entries) {
-        if (!first) out += ',';
-        first = false;
-        out += "{\"slug\":\"" + e.slug + "\",\"file\":\"" + e.file + "\",\"abi\":"
-             + std::to_string(e.abi)
-             + ",\"provides_gait\":\"" + e.provides_gait + "\""
-             + ",\"autorun\":"   + (e.autorun   ? "true" : "false")
-             + ",\"behaviour\":" + (e.behaviour ? "true" : "false")
-             + ",\"on\":[";
-        for (std::size_t i = 0; i < e.on.size(); ++i) {
-            if (i) out += ',';
-            out += "\"" + e.on[i] + "\"";
-        }
-        out += "]}";
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return "{\"skills\":[]}";
+    cJSON *list = cJSON_AddArrayToObject(root, "skills");
+    for (const Entry &e : all()) {
+        cJSON *item = cJSON_CreateObject();
+        cJSON_AddStringToObject(item, "slug", e.slug.c_str());
+        cJSON_AddStringToObject(item, "file", e.file.c_str());
+        cJSON_AddNumberToObject(item, "abi", e.abi);
+        cJSON_AddStringToObject(item, "provides_gait", e.provides_gait.c_str());
+        cJSON_AddBoolToObject(item, "autorun", e.autorun);
+        cJSON_AddBoolToObject(item, "behaviour", e.behaviour);
+        cJSON_AddBoolToObject(item, "valid", e.valid);
+        cJSON_AddStringToObject(item, "error", e.error.c_str());
+        cJSON *events = cJSON_AddArrayToObject(item, "on");
+        for (const std::string &event : e.on)
+            cJSON_AddItemToArray(events, cJSON_CreateString(event.c_str()));
+        cJSON_AddItemToArray(list, item);
     }
-    return out + "]}";
+    char *printed = cJSON_PrintUnformatted(root);
+    std::string out = printed ? printed : "{\"skills\":[]}";
+    cJSON_free(printed);
+    cJSON_Delete(root);
+    return out;
 }
 
 }  // namespace skills

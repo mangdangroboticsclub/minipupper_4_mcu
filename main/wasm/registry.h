@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -21,8 +22,11 @@
  * whatever moves the module moves the metadata with it. A runtime that does
  * not know the section ignores it.
  *
- * This module scans the filesystem, reads those sections, and caches the
- * result. Rescan on upload and delete; it is not free.
+ * This module scans the filesystem, reads those sections when available,
+ * and caches the result. Manifest-less .wasm files use their filename as the
+ * slug. Encrypted .mpxe files are authenticated and decrypted for indexing,
+ * then their plaintext is erased. Invalid files stay visible for deletion but
+ * cannot provide movements or run. Rescan after install/delete; it is not free.
  *
  * Only `provides_gait` is acted on in this firmware so far (POST
  * /v1/robot/gait starts the skill). `autorun` and `on` are parsed and
@@ -38,26 +42,30 @@ struct Entry {
     int  abi       = 0;
     bool autorun   = false;    /**< start at boot                          */
     bool behaviour = false;    /**< run without a total watchdog           */
+    bool valid = true;         /**< authenticated and minimally loadable     */
+    std::string error;         /**< validation failure, safe to show in UI   */
 };
 
-/** Re-read every .wasm on the filesystem. Call after upload, delete, install. */
+/** Re-read every .wasm/.mpxe on the filesystem after install or delete. */
 void rescan();
 
-/** Everything currently known. Cheap; rescan() does the work. */
-const std::vector<Entry> &all();
+/** A stable snapshot; a concurrent rescan cannot invalidate the returned data. */
+std::vector<Entry> all();
 
-/** The skill providing this movement name, or nullptr. Case-sensitive. */
-const Entry *by_gait(const char *gait_name);
+/** The valid skill providing this movement name. Duplicates are ambiguous. */
+std::optional<Entry> by_gait(const char *gait_name);
 
-/** The skill with this slug, or nullptr. */
-const Entry *by_slug(const char *slug);
+/** The skill with this slug. Duplicate slugs are ambiguous. */
+std::optional<Entry> by_slug(const char *slug);
 
-/** Every skill that asked to be run on `event`. */
-std::vector<const Entry *> by_event(const char *event);
+/** The skill with this exact file path, including invalid entries. */
+std::optional<Entry> by_file(const char *path);
 
-/** The one skill marked autorun, or nullptr. Later ones are ignored and
- *  logged: two skills both claiming the boot slot is a mistake, not a queue. */
-const Entry *autorun_entry();
+/** Snapshots of every valid skill that asked to be run on `event`. */
+std::vector<Entry> by_event(const char *event);
+
+/** The one valid skill marked autorun. Later ones are ignored and logged. */
+std::optional<Entry> autorun_entry();
 
 /**
  * @brief Read the embedded manifest out of a module in memory.

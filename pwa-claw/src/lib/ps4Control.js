@@ -10,13 +10,6 @@ export function ps4TurnRate(nx) {
   return -(+t.toFixed(3));
 }
 
-/** Match the firmware power response; it has no `powered` field. */
-export function ps4PowerSucceeded(response, action) {
-  return response?.ok === true
-    && response.resting === false
-    && response.holding === (action === "hold");
-}
-
 /** Analog Pose mode: right = yaw right, up = nose up. */
 export function ps4PoseAngles(nx, ny) {
   const m = Math.hypot(nx, ny);

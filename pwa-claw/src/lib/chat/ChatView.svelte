@@ -104,16 +104,6 @@
     return (first?.text || convo.title || "Voice chat").trim();
   }
 
-  function voiceReply(convo) {
-    const turns = convo.messages || [];
-    for (let i = turns.length - 1; i >= 0; i--) {
-      if (turns[i].role === "bot" || turns[i].role === "assistant") {
-        return turns[i].text.trim();
-      }
-    }
-    return "";
-  }
-
   function voiceWhen(convo) {
     const ts = convo.updatedAt || convo.createdAt;
     if (!ts) return "";
@@ -431,7 +421,7 @@
     socket.onopen = () => {
       if (socket !== ws) return;        // stale socket — ignore
       connected = true;
-      sendSessionReset(sessionId, { pwa_build: "brains-v20" });
+      sendSessionReset(sessionId, { pwa_build: "brains-v21" });
       probeLocalBrain();
       void loadVoiceHistory();
     };
@@ -1014,36 +1004,23 @@
       {#if latestVoice || voiceState.state !== "idle"}
         <button
           type="button"
-          class="voice-recent"
+          class="voice-chip"
           class:live={latestVoiceLive}
           aria-label={latestVoice ? "Open latest voice conversation" : "Open voice conversation in progress"}
           title={latestVoice ? `Open voice conversation (${voiceWhen(latestVoice)})` : "Voice conversation in progress"}
           onclick={() => openVoicePanel(latestVoice?.id || null)}
         >
-          <span class="voice-recent-icon" aria-hidden="true">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+          <span class="voice-chip-icon" aria-hidden="true">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
               <rect x="9" y="3" width="6" height="11" rx="3"/>
               <path d="M5 11a7 7 0 0 0 14 0M12 18v3"/>
             </svg>
           </span>
-          <span class="voice-recent-copy">
-            <span class="voice-recent-heading">
-              <span class="voice-recent-label">
-                {#if latestVoiceLive}<span class="voice-dot" aria-hidden="true"></span>{/if}
-                {latestVoiceLive ? `Voice · ${voiceState.state}` : "Latest voice chat"}
-              </span>
-              <span class="voice-recent-when">{latestVoice ? voiceWhen(latestVoice) : "Now"}</span>
-            </span>
-            <span class="voice-recent-title">{latestVoice ? voiceTitle(latestVoice) : "Listening for your voice…"}</span>
-            {#if latestVoice && voiceReply(latestVoice)}
-              <span class="voice-recent-reply">{voiceReply(latestVoice)}</span>
-            {/if}
+          {#if latestVoiceLive}<span class="voice-dot" aria-hidden="true"></span>{/if}
+          <span class="voice-chip-title">
+            {latestVoice ? (latestVoiceLive ? `${voiceState.state} · ${voiceTitle(latestVoice)}` : voiceTitle(latestVoice)) : "Listening now…"}
           </span>
-          {#if latestVoice}
-            <svg class="voice-recent-open" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <path d="m9 18 6-6-6-6"/>
-            </svg>
-          {/if}
+          <span class="voice-chip-when">{latestVoice ? voiceWhen(latestVoice) : "Now"}</span>
         </button>
       {/if}
       {#if voiceWakeError && !showVoicePanel}
@@ -1102,82 +1079,46 @@
 </div>
 
 <style>
-  /* The newest voice transcript gets a useful preview, not another chip row.
-   * Every older transcript is still available from the History drawer. */
-  .voice-recent {
-    display: grid;
-    grid-template-columns: auto minmax(0, 1fr) auto;
-    align-items: center;
-    gap: 10px;
-    width: 100%;
-    margin: 0 0 9px;
-    padding: 10px 12px;
-    border: 1px solid var(--hair);
-    border-radius: 16px;
-    background: var(--panel, var(--page));
-    color: var(--ink);
-    font: inherit;
-    text-align: left;
-    cursor: pointer;
-    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.04);
-  }
-
-  .voice-recent:hover { border-color: var(--sub); }
-  .voice-recent:focus-visible { outline: 3px solid var(--ink); outline-offset: 2px; }
-  .voice-recent:disabled { opacity: 1; cursor: default; }
-  .voice-recent.live { border-color: var(--accent, var(--sub)); }
-
-  .voice-recent-icon {
-    display: grid;
-    place-items: center;
-    width: 36px;
-    height: 36px;
-    border-radius: 12px;
-    background: var(--page);
-    color: var(--sub);
-  }
-
-  .voice-recent.live .voice-recent-icon { color: var(--ink); }
-  .voice-recent-copy { display: block; min-width: 0; }
-
-  .voice-recent-heading {
+  /* Newest voice transcript as a compact chip, not a banner: one line, so the
+   * transcript above stays the focus. Older transcripts live in History. */
+  .voice-chip {
     display: flex;
     align-items: center;
-    justify-content: space-between;
-    gap: 8px;
-    margin-bottom: 3px;
-  }
-
-  .voice-recent-label {
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-    min-width: 0;
+    gap: 6px;
+    width: fit-content;
+    max-width: calc(var(--page-max) - 32px);
+    margin: 0 auto 8px;
+    padding: 4px 10px 4px 8px;
+    border: 1px solid var(--hair);
+    border-radius: 999px;
+    background: var(--panel, var(--page));
     color: var(--sub);
-    font-size: 10px;
-    font-weight: 800;
-    letter-spacing: 0.055em;
-    text-transform: uppercase;
+    font: inherit;
+    font-size: 12px;
+    cursor: pointer;
   }
 
-  .voice-recent-when {
+  .voice-chip:hover { border-color: var(--sub); color: var(--ink); }
+  .voice-chip:focus-visible { outline: 3px solid var(--ink); outline-offset: 2px; }
+  .voice-chip.live { border-color: var(--accent, var(--sub)); color: var(--ink); }
+
+  .voice-chip-icon { display: grid; place-items: center; flex: 0 0 auto; }
+
+  .voice-chip-title {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--ink);
+    font-weight: 650;
+  }
+
+  .voice-chip-when {
     flex: 0 0 auto;
     color: var(--sub);
     font-size: 11px;
     font-variant-numeric: tabular-nums;
   }
-
-  .voice-recent-title,
-  .voice-recent-reply {
-    display: block;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .voice-recent-title { font-size: 13px; font-weight: 750; }
-  .voice-recent-reply { margin-top: 2px; color: var(--sub); font-size: 12px; }
-  .voice-recent-open { color: var(--sub); }
 
   .voice-dot {
     width: 6px;

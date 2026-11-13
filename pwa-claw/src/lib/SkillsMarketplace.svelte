@@ -1,6 +1,7 @@
 <script>
   import { detectCurrency, setPreferredCurrency } from "./currency.js";
   import SkillPreview from "./SkillPreview.svelte";
+  import { installMotionSkill, marketplaceSkillType } from "./skillActions.js";
   import {
     listSkills,
     getSkill,
@@ -8,6 +9,7 @@
     listRobotSkills,
     removeSkill,
     deploySkill,
+    enqueueLua,
     createCheckout,
     getOrder,
   } from "./marketplaceApi.js";
@@ -19,8 +21,10 @@
    * gateway's HTTPS checkout and polls the order, as before.
    *
    * @prop onNavigate — ("skills") => void
+   * @prop deployedSkills — browser-known Move package files
+   * @prop onDeployedChange — persist the complete deployment map
    */
-  let { onNavigate } = $props();
+  let { onNavigate, deployedSkills = {}, onDeployedChange } = $props();
 
   const MINOR_DIGITS = {
     BIF: 0, CLP: 0, DJF: 0, GNF: 0, IDR: 0, ISK: 0, JPY: 0, KMF: 0, KRW: 0,
@@ -75,7 +79,7 @@
   $effect(() => { refreshAll(); });
 
   // ── Helpers ──
-  const typeOf = (s) => ((s?.skill_type || "").toLowerCase() === "wasm" ? "wasm" : "awa");
+  const typeOf = marketplaceSkillType;
   const isOwned = (id) => robotSkills.some((s) => s.skill_id === id);
   function author(skill) {
     if (detailManifest?.author && detailSkill?.id === skill?.id) return detailManifest.author;
@@ -148,7 +152,7 @@
   const results = $derived.by(() => {
     const q = query.trim().toLowerCase();
     if (!q) return [];
-    return skills.filter((s) => [s.title, s.description, s.id, ...tagsOf(s)].filter(Boolean).join(" ").toLowerCase().includes(q));
+    return skills.filter((s) => typeOf(s) && [s.title, s.description, s.id, ...tagsOf(s)].filter(Boolean).join(" ").toLowerCase().includes(q));
   });
 
   function scrollTop() { queueMicrotask(() => scrollEl?.scrollTo({ top: 0, behavior: "smooth" })); }
@@ -197,48 +201,68 @@
 
   // ── Checkout (link-out: card entry happens on HTTPS) ──
   let checkoutSkill = $state(null);
-  let checkoutStage = $state("creating");  // creating | awaiting | paid | error
+  let checkoutStage = $state("creating");  // creating | awaiting | installing | install-error | paid | error
   let checkoutUrl = $state("");
   let checkoutError = $state("");
   let checkoutOrderId = $state("");
   let checkoutPollTimer = null;
   let copied = $state(false);
+  let checkoutGeneration = 0;
+  let purchaseStarted = false;
+
+  function rememberDeployment(skillId, paths) {
+    const next = { ...deployedSkills, [skillId]: paths };
+    try { localStorage.setItem("mpx_deployed_skills", JSON.stringify(next)); } catch {}
+    onDeployedChange?.(next);
+  }
 
   function openCheckout(skill) {
+    const generation = ++checkoutGeneration;
+    purchaseStarted = false;
     checkoutSkill = skill;
     checkoutStage = "creating";
     checkoutUrl = "";
     checkoutError = "";
     checkoutOrderId = "";
     copied = false;
-    handleCheckout(skill);
+    handleCheckout(skill, generation);
   }
-  function closeCheckout() { stopCheckoutPoll(); checkoutSkill = null; checkoutStage = "creating"; }
+  function closeCheckout() {
+    ++checkoutGeneration;
+    purchaseStarted = false;
+    stopCheckoutPoll();
+    checkoutSkill = null;
+    checkoutStage = "creating";
+  }
   function stopCheckoutPoll() { if (checkoutPollTimer) { clearInterval(checkoutPollTimer); checkoutPollTimer = null; } }
 
-  async function handleCheckout(skill) {
+  async function handleCheckout(skill, generation = checkoutGeneration) {
     checkoutStage = "creating";
     checkoutError = "";
     try {
       const data = await createCheckout(skill.id);
+      if (generation !== checkoutGeneration) return;
       checkoutOrderId = data.order_id || "";
       checkoutUrl = data.checkout_url || "";
-      if (data.status === "paid" || data.status === "fulfilled") { await finishPurchase(skill); return; }
+      if (data.status === "paid" || data.status === "fulfilled") { await finishPurchase(skill, generation); return; }
       try { await navigator.clipboard.writeText(checkoutUrl); copied = true; } catch { /* copy by hand */ }
       checkoutStage = "awaiting";
-      startCheckoutPoll(skill);
+      startCheckoutPoll(skill, generation);
     } catch (e) {
+      if (generation !== checkoutGeneration) return;
       console.error("Checkout failed:", e);
       checkoutStage = "error";
       checkoutError = e.message || "Checkout failed";
     }
   }
-  function startCheckoutPoll(skill) {
+  function startCheckoutPoll(skill, generation) {
     stopCheckoutPoll();
+    const orderId = checkoutOrderId;
     checkoutPollTimer = setInterval(async () => {
       try {
-        const order = await getOrder(checkoutOrderId);
-        if (order.status === "paid" || order.status === "fulfilled") await finishPurchase(skill);
+        const order = await getOrder(orderId);
+        if (generation !== checkoutGeneration) return;
+        if (order.status === "paid" || order.status === "fulfilled") await finishPurchase(skill, generation);
         else if (order.status === "failed" || order.status === "expired") {
           stopCheckoutPoll();
           checkoutStage = "error";
@@ -247,13 +271,37 @@
       } catch { /* keep polling */ }
     }, 2500);
   }
-  async function finishPurchase(skill) {
+  async function finishPurchase(skill, generation = checkoutGeneration) {
+    // setInterval does not await its previous callback: only one paid response
+    // may enter deployment, and it must still belong to the visible checkout.
+    if (purchaseStarted || generation !== checkoutGeneration) return;
+    purchaseStarted = true;
     stopCheckoutPoll();
-    checkoutStage = "paid";
-    await fetchRobotSkills();
-    if (typeOf(skill) === "wasm") {
-      try { await deploySkill(skill.id); } catch (e) { console.error("Deploy failed:", e); }
+    checkoutStage = typeOf(skill) === "wasm" ? "installing" : "fulfilling";
+    try {
+      await fetchRobotSkills();
+      if (generation !== checkoutGeneration) return;
+      if (typeOf(skill) === "wasm") {
+        // The gateway returns Lua deployment steps; fetching them alone does
+        // not put the Move skill on the robot.
+        await installMotionSkill(skill.id, {
+          deploySkill,
+          enqueueLua,
+          onPaths: (paths) => rememberDeployment(skill.id, paths),
+        });
+        if (generation !== checkoutGeneration) return;
+      }
+      checkoutStage = "paid";
+    } catch (e) {
+      if (generation !== checkoutGeneration) return;
+      console.error("Deploy failed:", e);
+      checkoutStage = "install-error";
+      checkoutError = e.message || "The skill could not be installed";
     }
+  }
+  function retryPurchase() {
+    purchaseStarted = false;
+    finishPurchase(checkoutSkill);
   }
   async function copyCheckoutUrl() {
     try { await navigator.clipboard.writeText(checkoutUrl); copied = true; setTimeout(() => (copied = false), 1800); } catch {}
@@ -529,15 +577,23 @@
         <div class="done">
           <span class="tick" aria-hidden="true"><svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5l6 5.5L20 6"/></svg></span>
           <h3>{isFree(checkoutSkill) ? "It's yours" : "Payment done"}</h3>
-          <p class="muted">{checkoutSkill.title} is in your Library{typeOf(checkoutSkill) === "wasm" ? " and on the robot" : ""}.</p>
+          <p class="muted">{checkoutSkill.title} {typeOf(checkoutSkill) === "wasm" ? "is installed on the robot" : "is ready in Web skills"}.</p>
           {#if checkoutOrderId}<p class="order">Order {checkoutOrderId}</p>{/if}
         </div>
         <button type="button" class="dark-btn wide" onclick={() => { closeCheckout(); onNavigate?.("skills"); }}>Open Skills</button>
         <button type="button" class="text-btn wide" onclick={closeCheckout}>Keep browsing</button>
+      {:else if checkoutStage === "install-error"}
+        <p class="err">Purchase complete, but the {typeOf(checkoutSkill) === "wasm" ? "Move skill was not installed" : "Web skill could not be refreshed"}: {checkoutError}</p>
+        <button type="button" class="dark-btn wide" onclick={retryPurchase}>Retry install</button>
+        <button type="button" class="text-btn wide" onclick={closeCheckout}>Close</button>
       {:else if checkoutStage === "error"}
         <p class="err">{checkoutError || "Something went wrong."}</p>
         <button type="button" class="dark-btn wide" onclick={() => handleCheckout(checkoutSkill)}>Try again</button>
         <button type="button" class="text-btn wide" onclick={closeCheckout}>Close</button>
+      {:else if checkoutStage === "installing"}
+        <p class="muted center"><span class="spinner" aria-hidden="true"></span>Installing on the robot…</p>
+      {:else if checkoutStage === "fulfilling"}
+        <p class="muted center"><span class="spinner" aria-hidden="true"></span>Preparing your Web skill…</p>
       {:else if checkoutStage === "creating"}
         <p class="muted center"><span class="spinner" aria-hidden="true"></span>Getting checkout ready…</p>
       {:else}

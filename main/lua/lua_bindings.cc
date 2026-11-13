@@ -33,6 +33,7 @@ extern "C" {
 #include "fs/littlefs_manager.h"
 #include "lua/lua_vm.h"
 #include "robot/robot.h"
+#include "wasm/registry.h"
 #include "wasm/wasm_sandbox.h"
 #include "wasm/wasm_decrypt.h"
 #include "network/chat_ws.h"
@@ -746,6 +747,17 @@ static int l_fs_read(lua_State *L)
     return 1;
 }
 
+static void rescan_after_skill_change(const char *path, bool ok)
+{
+    if (!ok) return;
+    const char *ext = strrchr(path, '.');
+    if (ext && (strcmp(ext, ".wasm") == 0 || strcmp(ext, ".mpxe") == 0)) {
+        // Marketplace downloads arrive through Lua, not /v1/skills/upload.
+        // Keep the registry, Agent tools, and PWA in sync immediately.
+        skills::rescan();
+    }
+}
+
 /**
  * fs.write(path, content) → bool
  *
@@ -777,6 +789,7 @@ static int l_fs_write(lua_State *L)
     if (!ok) {
         ESP_LOGE(TAG, "fs.write: failed to write '%s'", path);
     }
+    rescan_after_skill_change(path, ok);
 
     lua_pushboolean(L, ok ? 1 : 0);
     return 1;
@@ -806,6 +819,7 @@ static int l_fs_delete(lua_State *L)
     }
 
     bool ok = fs::delete_file(path);
+    rescan_after_skill_change(path, ok);
     lua_pushboolean(L, ok ? 1 : 0);
     return 1;
 }

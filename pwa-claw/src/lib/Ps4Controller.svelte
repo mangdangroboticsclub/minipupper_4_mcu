@@ -1,10 +1,10 @@
 <script>
-  import { PS4_DEADZONE, ps4PoseAngles, ps4PowerSucceeded, ps4TurnRate } from "./ps4Control.js";
+  import { PS4_DEADZONE, ps4PoseAngles, ps4TurnRate } from "./ps4Control.js";
 
   /**
    * Mini Pupper's PS4 layout: L1 power, R1 Pose/Trot, left stick walks in
    * Trot, right stick turns in Trot and aims yaw/pitch in Pose. The D-pad
-   * handles height/roll and the blue pentagon is the only action (Jump).
+   * handles height/roll; only the blue pentagon action sends a command (Jump).
    */
   let { online = true, wide = false, rotated = false, onExitWide } = $props();
 
@@ -15,7 +15,6 @@
   let powered = $state(false);
   let trotMode = $state(false);
   let transitioning = $state(false);
-  let powerError = $state("");
 
   const stickOf = (which) => which === "move" ? move : pose;
   const controlsHeld = () => move.active || pose.active || pressed.size > 0;
@@ -70,7 +69,8 @@
     sendGait("none");
   }
 
-  // One attitude request in flight; only the latest stick pose waits.
+  // One direct-pose request in flight; only the latest stick/roll target waits.
+  // Pose uses the same smoothly interpolated Look API as the Haris scheme.
   let attitudePending = null, attitudeTimer = null;
   let attitudeInFlight = Promise.resolve(), attitudeSending = false;
   let attitudeLastSent = "";
@@ -80,13 +80,15 @@
     if (attitudeSending) { attitudeTimer = setTimeout(attitudeSend, 80); return; }
     const next = attitudePending;
     attitudePending = null;
-    const key = `${next.roll},${next.pitch},${next.yaw}`;
-    if (key === attitudeLastSent) return;
-    attitudeLastSent = key;
+    const url = next.look
+      ? `/v1/robot/look?yaw=${next.yaw}&pitch=${next.pitch}`
+      : `/v1/robot/attitude?roll=${next.roll}&pitch=${next.pitch}&yaw=${next.yaw}&speed_dps=60`;
+    if (url === attitudeLastSent) return;
+    attitudeLastSent = url;
     attitudeSending = true;
     attitudeInFlight = (async () => {
       try {
-        await fetch(`/v1/robot/attitude?roll=${next.roll}&pitch=${next.pitch}&yaw=${next.yaw}`, { cache: "no-store" });
+        await fetch(url, { cache: "no-store" });
       } catch { /* transient; further stick movement retries */ }
     })().finally(() => {
       attitudeSending = false;
@@ -103,9 +105,9 @@
     attitudeTimer = null;
     attitudePending = null;
     await attitudeInFlight;
-    attitudeLastSent = `${roll},${pitch},${yaw}`;
+    attitudeLastSent = `/v1/robot/attitude?roll=${roll}&pitch=${pitch}&yaw=${yaw}&speed_dps=60`;
     try {
-      await fetch(`/v1/robot/attitude?roll=${roll}&pitch=${pitch}&yaw=${yaw}`, { cache: "no-store" });
+      await fetch(`/v1/robot/attitude?roll=${roll}&pitch=${pitch}&yaw=${yaw}&speed_dps=60`, { cache: "no-store" });
     } catch { /* power-off still gates every subsequent control */ }
   }
 
@@ -152,7 +154,7 @@
     s.pointerId = null;
     s.nx = s.ny = s.dx = s.dy = 0;
     if (!trotMode) {
-      sendAttitude(0, 0, 0);
+      sendLook(0, 0);
       return;
     }
     if (which === "move") joyF = joyS = 0;
@@ -173,8 +175,7 @@
     s.dx = dx; s.dy = dy; s.nx = nx; s.ny = ny;
 
     if (!trotMode) {
-      const angles = ps4PoseAngles(nx, ny);
-      sendAttitude(0, angles.pitch, angles.yaw);
+      sendLook(nx, ny);
       return;
     }
     if (which === "move") {
@@ -187,7 +188,13 @@
     else stopTrotIfIdle();
   }
 
-  // ── D-pad and the single Jump action ────────────────────────
+  function sendLook(nx, ny) {
+    const angles = ps4PoseAngles(nx, ny);
+    attitudePending = { look: true, yaw: angles.yaw, pitch: angles.pitch };
+    if (!attitudeTimer) attitudeSend();
+  }
+
+  // ── D-pad and face buttons; only Jump has a robot action ─────
   const BODY_ROLL = { "dpad-left": -15, "dpad-right": 15 };
   const HEIGHT_GAIT = { "dpad-up": "heightup", "dpad-down": "heightdown" };
   function press(id) {
@@ -207,36 +214,25 @@
 
   // ── L1 power and R1 mode ────────────────────────────────────
   async function sendPower(action) {
-    const r = await fetch("/v1/robot/power", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action }),
-    });
-    if (!r.ok) throw new Error("power request rejected");
-    const j = await r.json();
-    if (!ps4PowerSucceeded(j, action)) throw new Error("unexpected power state");
-  }
-  async function togglePower() {
-    if (transitioning) return;
-    transitioning = true;
-    powerError = "";
     try {
-      if (powered) {
-        await neutralizeRobot();
-        await sendPower("hold");
-        powered = false;
-        trotMode = false;
-      } else {
-        await sendPower("wake");
-        await neutralizeRobot();      // wake into a known, stationary Pose
-        trotMode = false;
-        powered = true;
-      }
-    } catch {
-      powerError = "Power command failed";
-    } finally {
-      transitioning = false;
+      await fetch("/v1/robot/power", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action }),
+      });
+    } catch { /* match the Haris power button: retain the local toggle state */ }
+  }
+  function togglePower() {
+    if (transitioning) return;
+    if (powered) {
+      void neutralizeRobot();
+      void sendPower("hold");
+      trotMode = false;
+    } else {
+      void sendPower("wake");
+      if (navigator.vibrate) { try { navigator.vibrate(12); } catch {} }
     }
+    powered = !powered;
   }
   async function toggleMode() {
     if (!powered || transitioning) return;
@@ -279,6 +275,12 @@
     { id: "dpad-left", pos: "left", label: "Roll body left", path: "M6 12l10-7v14z" },
     { id: "dpad-right", pos: "right", label: "Roll body right", path: "M18 12L8 5v14z" },
     { id: "dpad-down", pos: "down", label: "Body down", path: "M12 18L5 8h14z" },
+  ];
+  const FACE_BUTTONS = [
+    { id: "triangle", pos: "top", label: "Triangle (no action)", tone: "#14907F", shape: "triangle" },
+    { id: "square", pos: "left", label: "Square (no action)", tone: "#C2338A", shape: "square" },
+    { id: "circle", pos: "right", label: "Circle (no action)", tone: "#D83A34", shape: "circle" },
+    { id: "jump", pos: "bottom", label: "Jump", tone: "#2D6BCB", shape: "pentagon" },
   ];
 </script>
 
@@ -332,16 +334,23 @@
   </div>
 {/snippet}
 
-{#snippet jump()}
+{#snippet actions()}
   <div class="cluster">
     <div class="faces">
-      <button type="button" class="fbtn bottom" class:pressed={pressed.has("jump")} style="--tone: #2D6BCB" aria-label="Jump"
-        onpointerdown={(e) => btnDown(e, "jump")} onpointerup={(e) => btnUp(e, "jump")} onpointercancel={(e) => btnUp(e, "jump")}
-        onkeydown={(e) => btnKey(e, "jump")} onkeyup={(e) => btnKey(e, "jump")}>
-        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l9 6.5-3.4 10.5H6.4L3 9.5z"/></svg>
-      </button>
+      {#each FACE_BUTTONS as button (button.id)}
+        <button type="button" class="fbtn {button.pos}" class:pressed={pressed.has(button.id)} style="--tone: {button.tone}" aria-label={button.label}
+          onpointerdown={(e) => btnDown(e, button.id)} onpointerup={(e) => btnUp(e, button.id)} onpointercancel={(e) => btnUp(e, button.id)}
+          onkeydown={(e) => btnKey(e, button.id)} onkeyup={(e) => btnKey(e, button.id)}>
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            {#if button.shape === "triangle"}<path d="M12 4l8 15H4z"/>
+            {:else if button.shape === "square"}<rect x="5" y="5" width="14" height="14"/>
+            {:else if button.shape === "circle"}<circle cx="12" cy="12" r="8"/>
+            {:else}<path d="M12 3l9 6.5-3.4 10.5H6.4L3 9.5z"/>{/if}
+          </svg>
+        </button>
+      {/each}
     </div>
-    <span class="cap soft">Jump</span>
+    <span class="cap soft">Actions</span>
   </div>
 {/snippet}
 
@@ -376,14 +385,13 @@
       <div class="body">
         {@render dpad()}
         <div class="centre">{@render tools()}<div class="sticks">{@render stick("move", move)}{@render stick("pose", pose)}</div></div>
-        {@render jump()}
+        {@render actions()}
       </div>
     {:else}
       <div class="row-top">{@render shoulder("l")}{@render tools()}{@render shoulder("r")}</div>
-      <div class="row-mid">{@render dpad()}{@render jump()}</div>
+      <div class="row-mid">{@render dpad()}{@render actions()}</div>
       <div class="sticks">{@render stick("move", move)}{@render stick("pose", pose)}</div>
     {/if}
-    {#if powerError}<span class="power-error" role="alert">{powerError}</span>{/if}
   </section>
 </div>
 
@@ -422,7 +430,6 @@
   .tool { width: 44px; height: 44px; border-radius: 22px; border: none; background: rgba(17,17,17,.08); color: var(--ink); display: grid; place-items: center; cursor: pointer; }
   .tool svg { width: 18px; height: 18px; }
   .unpowered :is(.dpad, .faces, .well) { opacity: .45; filter: saturate(.3); cursor: not-allowed; transition: opacity var(--dur-med), filter var(--dur-med); }
-  .power-error { align-self: center; margin-top: 10px; font-size: 12px; font-weight: 700; color: #8B1E1E; }
   .dpad { position: relative; display: grid; grid-template-columns: repeat(3, var(--btn)); grid-template-rows: repeat(3, var(--btn)); grid-template-areas: ". up ." "left hub right" ". down ."; }
   .dkey { border: none; background: #FFFCF0; color: var(--ink); box-shadow: 0 3px 0 rgba(130,95,0,.35); display: grid; place-items: center; cursor: pointer; touch-action: none; }
   .dkey svg { width: 36%; height: 36%; fill: currentColor; }
@@ -435,6 +442,9 @@
   .faces { display: grid; grid-template-columns: repeat(3, var(--btn)); grid-template-rows: repeat(3, var(--btn)); grid-template-areas: ". top ." "left . right" ". bottom ."; place-items: center; }
   .fbtn { width: var(--btn); height: var(--btn); border-radius: 50%; border: none; background: #FFFCF0; box-shadow: 0 3px 0 rgba(130,95,0,.35); display: grid; place-items: center; cursor: pointer; touch-action: none; }
   .fbtn svg { width: 42%; height: 42%; fill: none; stroke: var(--tone); stroke-width: 2.6; stroke-linejoin: round; }
+  .fbtn.top { grid-area: top; }
+  .fbtn.left { grid-area: left; }
+  .fbtn.right { grid-area: right; }
   .fbtn.bottom { grid-area: bottom; }
   .fbtn.pressed { transform: translateY(3px); box-shadow: 0 0 0 transparent; background: var(--tone); }
   .fbtn.pressed svg { stroke: #fff; }

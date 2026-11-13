@@ -1,15 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { PS4_DEADZONE, ps4PoseAngles, ps4PowerSucceeded, ps4TurnRate } from "../src/lib/ps4Control.js";
-
-test("PS4 power accepts the firmware wake/hold response schema", () => {
-  assert.equal(ps4PowerSucceeded({ ok: true, resting: false, holding: false, state: "awake" }, "wake"), true);
-  assert.equal(ps4PowerSucceeded({ ok: true, resting: false, holding: true, state: "holding" }, "hold"), true);
-  assert.equal(ps4PowerSucceeded({ ok: true, resting: false, holding: false }, "hold"), false);
-  assert.equal(ps4PowerSucceeded({ ok: true, resting: false, holding: true }, "wake"), false);
-  assert.equal(ps4PowerSucceeded({ ok: true, resting: true, holding: false }, "wake"), false);
-  assert.equal(ps4PowerSucceeded({ ok: false, resting: false, holding: false }, "wake"), false);
-});
+import { PS4_DEADZONE, ps4PoseAngles, ps4TurnRate } from "../src/lib/ps4Control.js";
 
 test("PS4 turn stick respects deadzone and turns in the stick direction", () => {
   assert.equal(ps4TurnRate(0), 0);

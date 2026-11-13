@@ -41,7 +41,7 @@
  * is never touched again, the app still updates correctly.
  */
 
-const CACHE_VERSION = "v19-claw";  // v9: mpv2-claw app ported to mpx-dog; v10: Display page screen settings; v11: AI modes list + voice card; v12: chat brain toggle (Pupper / Cloud) + own-AI mode; v13: mpv2-claw ede0804 (Servo Studio rework, Turn/Look right stick, PC Home pad, socket rate limit, calibration +-90); v14: new chats default to Pupper (on-device agent); v15: voice conversation strip in the chat window; v16: latest voice chat preview above the composer; v17: empty-new-chat microphone wake button; v18: dedicated voice panel with end/new/clear and barge-in; v19: keep PWA sockets out of the orphan reaper, tail-only voice history reads
+const CACHE_VERSION = "v20-claw";  // v9: mpv2-claw app ported to mpx-dog; v10: Display page screen settings; v11: AI modes list + voice card; v12: chat brain toggle (Pupper / Cloud) + own-AI mode; v13: mpv2-claw ede0804 (Servo Studio rework, Turn/Look right stick, PC Home pad, socket rate limit, calibration +-90); v14: new chats default to Pupper (on-device agent); v15: voice conversation strip in the chat window; v16: latest voice chat preview above the composer; v17: empty-new-chat microphone wake button; v18: dedicated voice panel with end/new/clear and barge-in; v19: keep PWA sockets out of the orphan reaper, tail-only voice history reads; v20: latest voice chat is a one-line chip above the composer
 const CACHE = `mpx-dog-${CACHE_VERSION}`;
 
 /**

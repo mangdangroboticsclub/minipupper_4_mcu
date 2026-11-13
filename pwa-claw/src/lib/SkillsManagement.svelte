@@ -7,21 +7,23 @@
     enqueueLua,
   } from "./marketplaceApi.js";
   import {
+    deleteSkillFiles,
+    installMotionSkill,
+    marketplaceSkillType,
+    normalizeDeployedSkills,
     prettySkillName,
+    reconcileDeployedSkills,
+    registryEntryForSkill,
+    registryRunName,
     runSkill,
     skillActionId,
-    skillPathsFromScripts,
-    skillRunNameFromPaths,
-    waitForSkillFiles,
   } from "./skillActions.js";
 
   /**
-   * Skills: what is on the robot, and what you own but haven't put on it.
-   *
-   * AI skills (marketplace type "awa") run in the agent and are switched on or
-   * off. Motion skills ("wasm") are files installed into the robot's storage.
-   * Skill files already on the robot (/v1/skills/registry) show under On robot
-   * even when the store can't be reached.
+   * Web skills run in the Agent and are switched on or off. Move skills are
+   * files installed into the robot's storage. The firmware registry is the
+   * installed-source-of-truth, so manually installed and encrypted skills
+   * survive reboots and appear even when the Store cannot be reached.
    *
    * @prop onNavigate — ("store") => void
    * @prop pinned — Quick action ids
@@ -29,15 +31,17 @@
    * @prop onRegistryChange — (registryEntries) => void
    * @prop onDeployedChange — (browser-known deployed paths by skill id) => void
    */
-  let { onNavigate, pinned = [], onTogglePin, onRegistryChange, onDeployedChange } = $props();
+  let { onNavigate, online = true, pinned = [], onTogglePin, onRegistryChange, onDeployedChange } = $props();
 
-  let tab = $state("robot");            // "robot" | "library"
+  let tab = $state("web");              // "web" (Agent) | "move" (robot)
   let owned = $state([]);               // /v1/marketplace/robot/skills
   let catalog = $state({});             // skill id -> { description }
   let registry = $state([]);            // /v1/skills/registry skills
   let running = $state(null);           // name of the skill running now
   let loading = $state(true);
   let storeError = $state(false);
+  let robotError = $state(false);
+  let refreshGeneration = 0;
   let busy = $state(null);
   let toast = $state(null);
   let toastTimer = null;
@@ -52,65 +56,131 @@
   // so Remove can delete them again.
   const DEPLOYED_KEY = "mpx_deployed_skills";
   let deployed = $state({});
-  try { const raw = localStorage.getItem(DEPLOYED_KEY); if (raw) deployed = JSON.parse(raw); } catch {}
+  try {
+    const raw = localStorage.getItem(DEPLOYED_KEY);
+    if (raw) deployed = normalizeDeployedSkills(JSON.parse(raw));
+  } catch {}
   function saveDeployed() { try { localStorage.setItem(DEPLOYED_KEY, JSON.stringify(deployed)); } catch {} }
   $effect(() => { onDeployedChange?.(deployed); });
 
   async function refresh({ quiet = false } = {}) {
+    const generation = ++refreshGeneration;
     if (!quiet) loading = true;
     const [ownedRes, catRes, regRes, statRes] = await Promise.allSettled([
       listRobotSkills(),
       listSkills(),
-      fetch("/v1/skills/registry", { cache: "no-store" }).then((r) => (r.ok ? r.json() : null)),
-      fetch("/v1/skills/status", { cache: "no-store" }).then((r) => (r.ok ? r.json() : null)),
+      fetch("/v1/skills/registry", { cache: "no-store" }).then(async (r) => {
+        if (!r.ok) throw new Error(`Registry (${r.status})`);
+        return r.json();
+      }),
+      fetch("/v1/skills/status", { cache: "no-store" }).then(async (r) => {
+        if (!r.ok) throw new Error(`Skill status (${r.status})`);
+        return r.json();
+      }),
     ]);
+    if (generation !== refreshGeneration) return;
+
     storeError = ownedRes.status !== "fulfilled";
-    owned = ownedRes.status === "fulfilled" && Array.isArray(ownedRes.value) ? ownedRes.value : [];
+    if (ownedRes.status === "fulfilled" && Array.isArray(ownedRes.value)) owned = ownedRes.value;
     if (catRes.status === "fulfilled" && Array.isArray(catRes.value)) {
       catalog = Object.fromEntries(catRes.value.map((s) => [s.id, s]));
     }
-    registry = regRes.status === "fulfilled" && regRes.value?.skills ? regRes.value.skills : [];
-    onRegistryChange?.(registry);
-    running = statRes.status === "fulfilled" && statRes.value?.running ? statRes.value.name || "" : null;
+    robotError = regRes.status !== "fulfilled" || !Array.isArray(regRes.value?.skills);
+    if (!robotError) {
+      registry = regRes.value.skills;
+      const reconciled = reconcileDeployedSkills(deployed, registry);
+      if (JSON.stringify(reconciled) !== JSON.stringify(deployed)) {
+        deployed = reconciled;
+        saveDeployed();
+      }
+      onRegistryChange?.(registry);
+    }
+    if (statRes.status === "fulfilled") {
+      running = statRes.value?.running ? statRes.value.name || "" : null;
+      announceResult(statRes.value);
+    }
     loading = false;
   }
-  $effect(() => { refresh(); return () => clearTimeout(toastTimer); });
 
-  const isMotion = (s) => (s.skill_type || "").toLowerCase() === "wasm";
+  // A failed run is reported once per run, not on every reconnect or poll.
+  let announcedResult = null;
+  function announceResult(status) {
+    if (!status || status.running) {
+      announcedResult = null;
+      return;
+    }
+    if (!status.result) return;
+    const key = `${status.result}:${status.result_code}`;
+    if (key === announcedResult) return;
+    announcedResult = key;
+    if (status.result === "failed") say("Skill stopped because it failed to load or execute", "err");
+  }
+  $effect(() => {
+    if (online) refresh();
+    return () => clearTimeout(toastTimer);
+  });
+
+  // Reflect completion and externally started skills without a manual reload.
+  $effect(() => {
+    if (!running) return;
+    const timer = setInterval(async () => {
+      try {
+        const response = await fetch("/v1/skills/status", { cache: "no-store" });
+        if (response.ok) {
+          const status = await response.json();
+          running = status.running ? status.name || "" : null;
+          announceResult(status);
+        }
+      } catch { /* Keep the last known state until the robot answers. */ }
+    }, 1000);
+    return () => clearInterval(timer);
+  });
+
+  const isMotion = (s) => marketplaceSkillType(s) === "wasm";
   const tail = (id) => (id || "").split("~").pop();
   const pretty = prettySkillName;
 
-  function registryFor(skillId) {
-    const t = tail(skillId);
-    return registry.find((r) => r.slug === t || (r.file || "").replace(/^\//, "").startsWith(t));
-  }
-
   const items = $derived.by(() => {
-    const list = owned.map((s) => {
+    const list = owned.filter((s) => marketplaceSkillType(s)).map((s) => {
       const motion = isMotion(s);
-      const reg = motion ? registryFor(s.skill_id) : null;
+      const reg = motion ? registryEntryForSkill(registry, s.skill_id, deployed[s.skill_id]) : null;
       return {
         key: s.skill_id,
         name: s.title || pretty(tail(s.skill_id)),
-        desc: catalog[s.skill_id]?.description || "",
+        desc: reg?.valid === false ? (reg.error || "Skill failed validation") : (catalog[s.skill_id]?.description || ""),
         motion,
-        onRobot: motion ? s.skill_id in deployed || !!reg : !!s.enabled,
-        runName: reg ? reg.slug || reg.file.replace(/^\//, "") : skillRunNameFromPaths(deployed[s.skill_id]),
+        installed: !!reg,
+        enabled: !!s.enabled,
+        runName: registryRunName(reg, registry),
+        file: reg?.file || null,
+        valid: reg?.valid !== false,
+        error: reg?.error || "",
         src: s,
       };
     });
-    // Files on the robot that no owned skill accounts for.
-    const claimed = new Set(list.map((i) => i.runName).filter(Boolean));
-    for (const r of registry) {
-      const name = r.slug || (r.file || "").replace(/^\//, "");
-      if (!name || claimed.has(name)) continue;
-      list.push({ key: "local:" + name, name: pretty(name), desc: "Installed on the robot", motion: true, onRobot: true, runName: name, src: null });
+    // Files on the robot that no owned Store package accounts for.
+    const claimed = new Set(list.map((item) => item.file).filter(Boolean));
+    for (const entry of registry) {
+      const runName = registryRunName(entry, registry);
+      if (!runName || claimed.has(entry.file)) continue;
+      list.push({
+        key: "local:" + entry.file,
+        name: pretty(runName),
+        desc: entry.valid === false ? (entry.error || "Skill failed validation") : "Installed on the robot",
+        motion: true,
+        installed: true,
+        runName,
+        file: entry.file,
+        valid: entry.valid !== false,
+        error: entry.error || "",
+        src: null,
+      });
     }
     return list;
   });
-  const onRobot = $derived(items.filter((i) => i.onRobot));
-  const library = $derived(items.filter((i) => !i.onRobot));
-  const shown = $derived(tab === "robot" ? onRobot : library);
+  const webSkills = $derived(items.filter((item) => !item.motion));
+  const moveSkills = $derived(items.filter((item) => item.motion));
+  const shown = $derived(tab === "web" ? webSkills : moveSkills);
 
   // ── Actions ──
   async function setEnabled(item, on) {
@@ -119,38 +189,50 @@
       await toggleSkill(item.key, on);
       await refresh({ quiet: true });
       say(`${item.name} ${on ? "is on" : "is off"}`);
-    } catch { say("Couldn't change that skill", "err"); }
+    } catch (error) { say(error.message || "Couldn't change that skill", "err"); }
     busy = null;
   }
 
   async function install(item) {
     busy = item.key;
     try {
-      const data = await deploySkill(item.key);
-      const scripts = [];
-      for (const s of data.skills || []) for (const cmd of s.commands || []) { scripts.push(cmd.script); await enqueueLua(cmd.script); }
-      const paths = skillPathsFromScripts(scripts);
-      deployed = { ...deployed, [item.key]: paths };
-      saveDeployed();
-      await waitForSkillFiles(paths);
+      await installMotionSkill(item.key, {
+        deploySkill,
+        enqueueLua,
+        onPaths: (paths) => {
+          // Keep auxiliary paths even if a later step fails, so Remove can
+          // clean up a partial deployment instead of leaving orphan files.
+          deployed = { ...deployed, [item.key]: paths };
+          saveDeployed();
+        },
+      });
       await refresh({ quiet: true });
       say(`${item.name} is on the robot`);
-    } catch {
-      say("Install failed", "err");
+    } catch (error) {
+      say(error.message || "Install failed", "err");
     }
     busy = null;
   }
 
   async function remove(item) {
+    if (running && running === item.runName) {
+      say("Stop the skill before removing it", "err");
+      return;
+    }
+    if (!confirm(`Remove ${item.name} from the robot?`)) return;
     busy = item.key;
     try {
-      for (const path of deployed[item.key] || []) {
-        await fetch("/v1/fs/delete", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path }) });
-      }
-      const next = { ...deployed }; delete next[item.key]; deployed = next; saveDeployed();
+      await deleteSkillFiles([...(deployed[item.key] || []), item.file]);
+      const next = { ...deployed };
+      delete next[item.key];
+      deployed = next;
+      saveDeployed();
       await refresh({ quiet: true });
       say(`${item.name} removed from the robot`);
-    } catch { say("Couldn't remove it", "err"); }
+    } catch (error) {
+      // Keep the package mapping unless every file was deleted successfully.
+      say(error.message || "Couldn't remove it", "err");
+    }
     busy = null;
   }
 
@@ -160,7 +242,7 @@
       if (running && running === item.runName) {
         const response = await fetch("/v1/skills/stop", { method: "POST" });
         if (!response.ok) throw new Error(`Couldn't stop skill (${response.status})`);
-        running = null;
+        // Stop is cooperative; keep showing Stop until status confirms exit.
         say(`Stopping ${item.name}`);
       } else {
         await runSkill(item.runName);
@@ -177,12 +259,12 @@
 <div class="skills">
   <header class="head">
     <h1>Skills</h1>
-    <div class="seg" role="tablist" aria-label="Where">
-      <button type="button" role="tab" aria-selected={tab === "robot"} class:on={tab === "robot"} onclick={() => (tab = "robot")}>
-        On robot{loading ? "" : ` · ${onRobot.length}`}
+    <div class="seg" role="tablist" aria-label="Skill type">
+      <button type="button" role="tab" aria-selected={tab === "web"} class:on={tab === "web"} onclick={() => (tab = "web")}>
+        Web skills{loading ? "" : ` · ${webSkills.length}`}
       </button>
-      <button type="button" role="tab" aria-selected={tab === "library"} class:on={tab === "library"} onclick={() => (tab = "library")}>
-        Library{loading ? "" : ` · ${library.length}`}
+      <button type="button" role="tab" aria-selected={tab === "move"} class:on={tab === "move"} onclick={() => (tab = "move")}>
+        Move skills{loading ? "" : ` · ${moveSkills.length}`}
       </button>
     </div>
   </header>
@@ -190,24 +272,23 @@
   <div class="scroll">
     <div class="inner">
       {#if storeError && !loading}
-        <p class="note">Couldn't reach the Store, so only skills already on the robot are shown.</p>
+        <p class="note">Couldn't reach the Store. Owned Web skills may be unavailable; installed Move skills still appear.</p>
+      {/if}
+      {#if robotError && !loading}
+        <p class="note">Couldn't read the robot's skill index. Showing the last known list; install and run may be unavailable.</p>
       {/if}
 
       {#if loading}
         {#each [0, 1, 2] as _}<div class="card sk" aria-hidden="true"><span class="sk-ico"></span><span class="sk-line"></span></div>{/each}
       {:else if shown.length === 0}
         <div class="empty">
-          <p class="empty-title">{tab === "robot" ? "Nothing on the robot yet" : "Your library is empty"}</p>
+          <p class="empty-title">{tab === "web" ? "No Web skills yet" : "No Move skills yet"}</p>
           <p class="empty-desc">
-            {tab === "robot"
-              ? "Turn on an AI skill or install a motion skill from your Library."
-              : "Skills you get in the Store land here, ready to put on the robot."}
+            {tab === "web"
+              ? "Web skills you own appear here and run in the Agent when turned on."
+              : "Move skills you own appear here. Install one to run it on the robot."}
           </p>
-          {#if tab === "robot" && library.length}
-            <button type="button" class="ghost" onclick={() => (tab = "library")}>Open Library</button>
-          {:else}
-            <button type="button" class="ghost" onclick={() => onNavigate?.("store")}>Go to the Store</button>
-          {/if}
+          <button type="button" class="ghost" onclick={() => onNavigate?.("store")}>Go to the Store</button>
         </div>
       {:else}
         <ul class="list">
@@ -224,41 +305,40 @@
               <div class="info">
                 <span class="name">{item.name}</span>
                 {#if item.desc}<span class="desc">{item.desc}</span>{/if}
-                <span class="chip" class:motion={item.motion}>{item.motion ? "Motion skill" : "AI skill"}</span>
+                <span class="chip" class:motion={item.motion}>{item.motion ? "Move skill · Robot" : "Web skill · Agent"}</span>
               </div>
               <div class="acts">
-                {#if tab === "robot"}
-                  {#if item.motion}
-                    {#if item.runName}
-                      <button type="button" class="btn skill-run" class:running={isRunning} disabled={busy === item.key} onclick={() => run(item)} aria-label="{isRunning ? 'Stop' : 'Run'} {item.name}">
-                        <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-                          {#if isRunning}<rect x="6" y="6" width="12" height="12" rx="2" />{:else}<path d="m8 5 11 7-11 7V5Z" />{/if}
-                        </svg>
-                        <span>{isRunning ? "Stop" : "Run"}</span>
-                      </button>
-                    {/if}
-                    {#if item.runName}
-                      {@const quickId = skillActionId(item.runName)}
-                      {@const isPinned = pinned.includes(quickId)}
-                      <button
-                        type="button"
-                        class="pin"
-                        class:on={isPinned}
-                        aria-pressed={isPinned}
-                        aria-label="{isPinned ? 'Remove' : 'Add'} {item.name} {isPinned ? 'from' : 'to'} Quick actions"
-                        onclick={() => onTogglePin?.(quickId)}
-                      >{isPinned ? "Pinned" : "Pin"}</button>
-                    {/if}
-                    {#if item.src && item.key in deployed}
-                      <button type="button" class="link" disabled={busy === item.key} onclick={() => remove(item)} aria-label="Remove {item.name} from the robot">Remove</button>
-                    {/if}
-                  {:else}
-                    <button type="button" class="btn dark" disabled={busy === item.key} onclick={() => setEnabled(item, false)} aria-label="Turn off {item.name}">Turn off</button>
-                  {/if}
-                {:else}
-                  <button type="button" class="btn" disabled={busy === item.key} onclick={() => (item.motion ? install(item) : setEnabled(item, true))} aria-label="{item.motion ? 'Install' : 'Turn on'} {item.name}">
-                    {busy === item.key ? "…" : item.motion ? "Install" : "Turn on"}
+                {#if !item.motion}
+                  <button type="button" class="btn" class:dark={item.enabled} disabled={busy === item.key} onclick={() => setEnabled(item, !item.enabled)} aria-label="{item.enabled ? 'Turn off' : 'Turn on'} {item.name}">
+                    {item.enabled ? "Turn off" : "Turn on"}
                   </button>
+                {:else if item.installed}
+                  {#if item.valid !== false}
+                    <button type="button" class="btn skill-run" class:running={isRunning} disabled={busy === item.key || (running && !isRunning)} onclick={() => run(item)} aria-label="{isRunning ? 'Stop' : 'Run'} {item.name}">
+                      <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                        {#if isRunning}<rect x="6" y="6" width="12" height="12" rx="2" />{:else}<path d="m8 5 11 7-11 7V5Z" />{/if}
+                      </svg>
+                      <span>{isRunning ? "Stop" : "Run"}</span>
+                    </button>
+                    {@const quickId = skillActionId(item.runName)}
+                    {@const isPinned = pinned.includes(quickId)}
+                    <button
+                      type="button"
+                      class="pin"
+                      class:on={isPinned}
+                      aria-pressed={isPinned}
+                      aria-label="{isPinned ? 'Remove' : 'Add'} {item.name} {isPinned ? 'from' : 'to'} Quick actions"
+                      onclick={() => onTogglePin?.(quickId)}
+                    >{isPinned ? "Pinned" : "Pin"}</button>
+                  {/if}
+                  <button type="button" class="link" disabled={busy === item.key || isRunning} onclick={() => remove(item)} aria-label="Remove {item.name} from the robot">Remove</button>
+                {:else}
+                  <button type="button" class="btn" disabled={busy === item.key} onclick={() => install(item)} aria-label="Install {item.name}">
+                    {busy === item.key ? "…" : "Install"}
+                  </button>
+                  {#if deployed[item.key]?.length}
+                    <button type="button" class="link" disabled={busy === item.key} onclick={() => remove(item)} aria-label="Clean up partial {item.name} install">Clean up</button>
+                  {/if}
                 {/if}
               </div>
             </li>

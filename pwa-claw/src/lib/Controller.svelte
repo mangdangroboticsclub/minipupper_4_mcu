@@ -365,7 +365,7 @@
     rollPending++;
     return (async () => {
       await joyInFlight; // finish the last walking packet before taking over
-      await queueMotionCommand(`/v1/robot/attitude?roll=${roll}`, { cache: "no-store" });
+      await queueMotionCommand(`/v1/robot/attitude?roll=${roll}&speed_dps=60`, { cache: "no-store" });
     })().finally(() => { rollPending--; });
   }
 

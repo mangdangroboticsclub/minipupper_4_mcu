@@ -102,7 +102,9 @@ extern "C" void app_main(void)
 	// ── Robot HAL (servo bus, gait task on Core 1) ─────────────
 	mpx_robot_set_skill_hooks(&s_skill_hooks);
 	robot::set_master_observer(on_master_changed);
-	if (!robot::init()) {
+	// Initialise through the facade: agent tools and the face use
+	// mpx_robot_ready(), whose state is set by mpx_robot_init().
+	if (!mpx_robot_init()) {
 		ESP_LOGE(TAG, "Robot HAL init failed — continuing without servo control");
 	}
 

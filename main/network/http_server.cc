@@ -349,9 +349,13 @@ static esp_err_t api_skills_list(httpd_req_t *req)
  * immediately, so httpd stays responsive while the skill runs.
  */
 static volatile bool s_skill_running = false;
+static volatile int s_skill_last_result = -1;
+static volatile bool s_skill_stop_requested = false;
 // Name of the skill running now, for GET /v1/skills/status. A fixed buffer
 // rather than std::string because the run task and httpd both touch it.
 static char s_skill_name[64] = "";
+// Canonical path protects the active file even when its manifest slug changes.
+static char s_skill_path[320] = "";
 /* Given when a run ends, for skill_wait(). Binary rather than a task
  * notification because the waiter (the agent's tool loop) is not the task that
  * started the run, and there can only be one run at a time. */
@@ -386,12 +390,16 @@ static void skill_run_task(void *arg)
 
     ESP_LOGI(TAG, "Running skill (async): %s", a->path.c_str());
     auto result = wasm::load_and_run(a->path.c_str(), "on_start", 60000);
+    s_skill_last_result = static_cast<int>(result);
     voice_glue::release("skill");
     ESP_LOGI(TAG, "Skill '%s' completed with result=%d",
              a->name.c_str(), static_cast<int>(result));
     delete a;
-    s_skill_name[0] = 0;
+    // Clear the running flag before the name/path: the delete guard reads the
+    // path while the flag is set, so it must never see an empty path.
     s_skill_running = false;
+    s_skill_name[0] = 0;
+    s_skill_path[0] = 0;
     if (s_skill_done) xSemaphoreGive(s_skill_done);
     /* Created with xTaskCreateWithCaps: the stack may be in PSRAM, and only
      * this call hands it back. */
@@ -409,8 +417,12 @@ static const char *start_skill_async(const std::string &path,
     if (s_skill_running) return "409 Conflict";
 
     s_skill_running = true;
+    s_skill_last_result = -1;
+    s_skill_stop_requested = false;
     std::strncpy(s_skill_name, name.c_str(), sizeof(s_skill_name) - 1);
     s_skill_name[sizeof(s_skill_name) - 1] = 0;
+    std::strncpy(s_skill_path, path.c_str(), sizeof(s_skill_path) - 1);
+    s_skill_path[sizeof(s_skill_path) - 1] = 0;
 
     /* skill_wait() is armed at start, not at first wait: a give left over from
      * a run nobody waited for would make the next wait return at once. */
@@ -445,6 +457,7 @@ static const char *start_skill_async(const std::string &path,
     if (created != pdPASS) {
         s_skill_running = false;
         s_skill_name[0] = 0;
+        s_skill_path[0] = 0;
         delete args;
         return "500 Internal Server Error";
     }
@@ -456,23 +469,20 @@ static const char *start_skill_async(const std::string &path,
  *
  * The old apps send the file name ("moonwalk.wasm"); the mpv2 app sends the
  * registry slug ("moonwalk") when the skill declares one. Both must land on
- * the same file, and the name reported by /v1/skills/status must be the one
- * the app compares against, which is the slug when there is one. */
+ * the same file. Slug invocation reports the slug; exact-file invocation keeps
+ * the filename so duplicate manifests cannot make Stop/Remove ambiguous. */
 static void resolve_skill_name(const std::string &given, std::string &path,
                                std::string &name)
 {
     path = (given[0] == '/') ? given : "/" + given;
-    name = given;
-    if (const skills::Entry *e = skills::by_slug(given.c_str())) {
+    name = (given[0] == '/') ? given.substr(1) : given;
+    if (auto e = skills::by_slug(given.c_str())) {
         path = e->file;
         name = e->slug;
         return;
     }
     for (const skills::Entry &e : skills::all()) {
-        if (e.file == path) {
-            if (!e.slug.empty()) name = e.slug;
-            return;
-        }
+        if (e.file == path) return;
     }
     if (!fs::file_exists(path.c_str()) && fs::file_exists((path + ".wasm").c_str())) {
         path += ".wasm";
@@ -488,6 +498,8 @@ const char *skill_start(const std::string &given, const std::string &params,
     if (given.empty()) return "no such skill";
     std::string path, name;
     resolve_skill_name(given, path, name);
+    if (const auto entry = skills::by_file(path.c_str()); entry && !entry->valid)
+        return "skill failed integrity check";
     if (!fs::file_exists(path.c_str())) return "no such skill";
     const char *fail = start_skill_async(path, name, params);
     if (fail) return fail[0] == '4' ? "a skill is already running" : "failed to start skill task";
@@ -497,7 +509,7 @@ const char *skill_start(const std::string &given, const std::string &params,
 
 const char *skill_start_for_movement(const char *movement, std::string *resolved)
 {
-    const skills::Entry *e = movement ? skills::by_gait(movement) : nullptr;
+    auto e = movement ? skills::by_gait(movement) : std::nullopt;
     if (!e) return "no such movement";
     const char *fail = start_skill_async(e->file, e->slug, "");
     if (fail) return fail[0] == '4' ? "a skill is already running" : "failed to start skill task";
@@ -511,7 +523,10 @@ const char *skill_running_name() { return s_skill_running ? s_skill_name : ""; }
 
 void skill_stop()
 {
-    if (s_skill_running) wasm::request_stop();
+    if (s_skill_running) {
+        s_skill_stop_requested = true;
+        wasm::request_stop();
+    }
 }
 
 bool skill_wait(uint32_t timeout_ms)
@@ -555,6 +570,20 @@ static esp_err_t api_skills_run(httpd_req_t *req)
     {
         const std::string given = skill_name;
         resolve_skill_name(given, path, skill_name);
+    }
+    if (const auto entry = skills::by_file(path.c_str()); entry && !entry->valid) {
+        httpd_resp_set_status(req, "422 Unprocessable Entity");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, R"({"ok":false,"err":"skill failed integrity check"})",
+                        HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    if (!fs::file_exists(path.c_str())) {
+        httpd_resp_set_status(req, "404 Not Found");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, R"({"ok":false,"err":"skill not installed"})",
+                        HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
     }
 
     /* Optional "params":"name=value;name=value" for mpx_param_f()/i().
@@ -600,6 +629,13 @@ static esp_err_t api_skills_status(httpd_req_t *req)
     if (s_skill_running && s_skill_name[0]) {
         json += ",\"name\":\"" + json_escape(s_skill_name) + "\"";
     }
+    if (!s_skill_running && s_skill_last_result >= 0) {
+        const char *state = s_skill_stop_requested ? "stopped"
+            : (s_skill_last_result == static_cast<int>(wasm::SandboxResult::Success)
+                   ? "succeeded" : "failed");
+        json += ",\"result\":\"" + std::string(state)
+              + "\",\"result_code\":" + std::to_string(s_skill_last_result);
+    }
     json += ",\"safe_mode\":false}";
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, json.c_str(), json.size());
@@ -614,7 +650,7 @@ static esp_err_t api_skills_status(httpd_req_t *req)
 static esp_err_t api_skills_stop(httpd_req_t *req)
 {
     const bool was_running = s_skill_running;
-    if (was_running) wasm::request_stop();
+    if (was_running) skill_stop();
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, was_running ? "{\"ok\":true,\"stopping\":true}"
                                      : "{\"ok\":true,\"stopping\":false}", -1);
@@ -808,6 +844,15 @@ static esp_err_t api_fs_delete(httpd_req_t *req)
         }
     }
 
+    if (s_skill_running) {
+        const std::string active_path = file_path[0] == '/' ? file_path : "/" + file_path;
+        if (active_path == s_skill_path) {
+            httpd_resp_set_status(req, "409 Conflict");
+            httpd_resp_send(req, "stop the skill before deleting it", -1);
+            return ESP_OK;
+        }
+    }
+
     if (fs::delete_file(file_path.c_str())) {
         skills::rescan();          // a gait it provided is gone with it
         httpd_resp_set_type(req, "application/json");
@@ -876,6 +921,10 @@ static esp_err_t api_fs_write(httpd_req_t *req)
         httpd_resp_set_status(req, "500 Server Error");
         httpd_resp_send(req, "write failed", -1);
         return ESP_OK;
+    }
+    if (file_path.size() >= 5) {
+        const std::string ext = file_path.substr(file_path.size() - 5);
+        if (ext == ".wasm" || ext == ".mpxe") skills::rescan();
     }
 
     std::string resp = "{\"ok\":true,\"p\":\"" + json_escape(file_path)
@@ -1081,7 +1130,7 @@ static esp_err_t api_robot_gait(httpd_req_t *req)
         // Not a built-in: a skill may provide a movement by this name
         // (its embedded manifest's provides_gait). Start it like
         // POST /v1/skills/run would, so the app's move grid can mix both.
-        if (const skills::Entry *e = skills::by_gait(mode.c_str())) {
+        if (auto e = skills::by_gait(mode.c_str())) {
             const char *fail = start_skill_async(e->file, e->slug, "");
             httpd_resp_set_type(req, "application/json");
             if (fail) {
@@ -1167,12 +1216,13 @@ static esp_err_t api_robot_look(httpd_req_t *req)
     return ESP_OK;
 }
 
-/* GET /v1/robot/attitude?roll=-25..25&pitch=-20..20&yaw=-30..30
+/* GET /v1/robot/attitude?roll=-25..25&pitch=-20..20&yaw=-30..30&speed_dps=60
  * Direct body-attitude hold. Omitted axes return to neutral; the PWA d-pad
- * uses roll alone so releasing either direction levels the body again. */
+ * uses roll alone so releasing either direction levels the body again.
+ * speed_dps is the optional slew rate: 0 snaps, positive values glide. */
 static esp_err_t api_robot_attitude(httpd_req_t *req)
 {
-    float roll = 0.0f, pitch = 0.0f, yaw = 0.0f;
+    float roll = 0.0f, pitch = 0.0f, yaw = 0.0f, speed_dps = 0.0f;
     char query[96] = {};
     bool valid = true;
     if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
@@ -1185,13 +1235,15 @@ static esp_err_t api_robot_attitude(httpd_req_t *req)
         parse_axis("roll", roll);
         parse_axis("pitch", pitch);
         parse_axis("yaw", yaw);
+        parse_axis("speed_dps", speed_dps);
     }
     if (!valid) {
         httpd_resp_set_status(req, "400 Bad Request");
-        httpd_resp_send(req, "attitude axes must be finite numbers", -1);
+        httpd_resp_send(req, "attitude axes and speed_dps must be finite numbers", -1);
         return ESP_OK;
     }
     if (robot::master_active()) return send_pi_in_control(req);
+    robot::set_attitude_speed(speed_dps);
     robot::set_body_attitude(roll, pitch, yaw);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, R"({"ok":true})", -1);

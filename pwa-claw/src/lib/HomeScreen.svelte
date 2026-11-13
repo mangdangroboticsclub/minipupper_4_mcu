@@ -12,7 +12,7 @@
   import SettingsPage from "./SettingsPage.svelte";
   import WifiSheet from "./WifiSheet.svelte";
   import SystemMonitor from "./SystemMonitor.svelte";
-  import { runSkill, skillActionsFromInstalled } from "./skillActions.js";
+  import { normalizeDeployedSkills, reconcileDeployedSkills, runSkill, skillActionsFromInstalled } from "./skillActions.js";
 
   let { network } = $props();
 
@@ -129,6 +129,16 @@
   const KEY_ASSIGN = "mpx_action_assignments";
   const KEY_CUSTOM = "mpx_custom_actions";
   const KEY_PINNED = "mpx_pinned_actions";
+  const KEY_SYSTEM_MONITOR = "mpx_system_monitor_enabled";
+  let systemMonitorEnabled = $state(true);
+  try {
+    const saved = localStorage.getItem(KEY_SYSTEM_MONITOR);
+    if (saved !== null) systemMonitorEnabled = saved === "true";
+  } catch {}
+  function setSystemMonitorEnabled(enabled) {
+    systemMonitorEnabled = enabled;
+    try { localStorage.setItem(KEY_SYSTEM_MONITOR, String(enabled)); } catch {}
+  }
   let actionAssignments = $state({});
   let customActions = $state([]);
   let pinnedActions = $state([]);
@@ -159,16 +169,21 @@
 
   try {
     const saved = localStorage.getItem("mpx_deployed_skills");
-    if (saved) deployedSkills = JSON.parse(saved);
+    if (saved) deployedSkills = normalizeDeployedSkills(JSON.parse(saved));
   } catch {}
 
   async function refreshSkillActions() {
     try {
       const response = await fetch("/v1/skills/registry", { cache: "no-store" });
-      if (response.ok) registrySkills = (await response.json()).skills || [];
+      if (response.ok) {
+        registrySkills = (await response.json()).skills || [];
+        // Do not resurrect deleted skills from stale browser-only metadata.
+        deployedSkills = reconcileDeployedSkills(deployedSkills, registrySkills);
+        try { localStorage.setItem("mpx_deployed_skills", JSON.stringify(deployedSkills)); } catch {}
+      }
     } catch { /* Skills return when the robot is reachable again. */ }
   }
-  $effect(() => { refreshSkillActions(); });
+  $effect(() => { if (online) refreshSkillActions(); });
 
   const allActions = $derived([
     ...actions,
@@ -350,7 +365,9 @@
             </button>
             <img class="logo" src="/md.svg" alt="MangDang" />
             <div class="head-right">
-              <SystemMonitor {online} />
+              {#if systemMonitorEnabled}
+                <SystemMonitor {online} />
+              {/if}
               {#if !desktop}
               <button type="button" class="round" onclick={enterWide} aria-label="Landscape controller">
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="7" width="18" height="10" rx="3"/><path d="M8 10v4M6 12h4M16 11h.01M18 13h.01"/></svg>
@@ -408,6 +425,7 @@
     {:else if activeTab === "skills"}
       <SkillsManagement
         embedded
+        {online}
         pinned={pinnedActions}
         onTogglePin={togglePin}
         onRegistryChange={(entries) => (registrySkills = entries)}
@@ -415,7 +433,12 @@
         onNavigate={(to) => { if (to === "store") activeTab = "store"; }}
       />
     {:else if activeTab === "store"}
-      <SkillsMarketplace embedded onNavigate={(to) => { if (to === "skills") activeTab = "skills"; }} />
+      <SkillsMarketplace
+        embedded
+        {deployedSkills}
+        onDeployedChange={(deployed) => (deployedSkills = deployed)}
+        onNavigate={(to) => { if (to === "skills") activeTab = "skills"; }}
+      />
     {:else if activeTab === "chat"}
       <div class="chat-tab">
         <ChatView navigate={(to) => { if (to === "home") activeTab = "home"; }} {network} />
@@ -425,7 +448,9 @@
         {network}
         {controlScheme}
         {controlSchemeReady}
+        {systemMonitorEnabled}
         onControlScheme={selectControlScheme}
+        onSystemMonitorChange={setSystemMonitorEnabled}
       />
     {/if}
   </main>
